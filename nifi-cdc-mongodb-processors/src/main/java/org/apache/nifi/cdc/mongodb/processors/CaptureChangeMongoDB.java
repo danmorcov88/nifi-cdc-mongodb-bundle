@@ -19,6 +19,8 @@ package org.apache.nifi.cdc.mongodb.processors;
 import com.mongodb.MongoCommandException;
 import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
+import com.mongodb.client.model.changestream.FullDocument;
+import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.PrimaryNodeOnly;
 import org.apache.nifi.annotation.behavior.Stateful;
@@ -33,7 +35,10 @@ import org.apache.nifi.cdc.mongodb.event.EventMapper;
 import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.ConfigVerificationResult;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.state.Scope;
+import org.apache.nifi.components.state.StateMap;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.mongodb.MongoDBClientService;
@@ -45,13 +50,17 @@ import org.apache.nifi.processor.VerifiableProcessor;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.serialization.RecordSetWriterFactory;
+import org.bson.BsonArray;
 import org.bson.BsonDocument;
+import org.bson.BsonTimestamp;
+import org.bson.BsonValue;
 import org.bson.Document;
 import org.bson.json.JsonMode;
 import org.bson.json.JsonWriterSettings;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -62,20 +71,22 @@ import java.util.concurrent.TimeUnit;
 @InputRequirement(InputRequirement.Requirement.INPUT_FORBIDDEN)
 @Tags({"mongodb", "cdc", "change stream", "replication", "event"})
 @CapabilityDescription("Retrieves Change Data Capture (CDC) events from MongoDB using Change Streams. The processor reads insert, update, "
-        + "replace, delete and invalidate events for a collection and writes them as records using the configured Record Writer, one "
-        + "FlowFile per batch. Each record has the fields operation, database, collection, document_key, full_document, "
-        + "full_document_before_change, updated_fields, removed_fields, cluster_time, wall_time, txn_number and resume_token. Documents "
-        + "are written as Extended JSON strings. The resume token is stored in the same transaction as the FlowFiles of a batch, so a "
-        + "failure replays events but never skips them. The processor never writes to the source database; it needs only the "
-        + "changeStream and find privileges on the watched collection. MongoDB 6.0 or later, running as a replica set or a sharded "
-        + "cluster, is required. Without stored state the stream starts at the moment the processor is started, so changes made while "
-        + "it is stopped for the first time are not captured. An invalidate event, which the server sends when the watched collection is "
-        + "dropped or renamed, is written like any other event and the stream continues after it. When the server is unreachable the "
-        + "processor waits longer after every failed attempt, up to a minute, and continues from the last committed position once the "
-        + "server answers again.")
+        + "replace, delete and invalidate events for one collection or for every collection of a database, and writes them as records "
+        + "using the configured Record Writer, one FlowFile per batch. Each record has the fields operation, database, collection, "
+        + "document_key, full_document, full_document_before_change, updated_fields, removed_fields, cluster_time, wall_time, txn_number "
+        + "and resume_token. Documents are written as Extended JSON strings. An aggregation pipeline can be given, and the server "
+        + "applies it before sending the events, so events that do not match never travel. The resume token is stored in the same "
+        + "transaction as the FlowFiles of a batch, so a failure replays events but never skips them. The processor never writes to the "
+        + "source database; it needs only the changeStream and find privileges on the watched scope. MongoDB 6.0 or later, running as a "
+        + "replica set or a sharded cluster, is required. Without stored state the stream starts where Start Position says, by default "
+        + "at the moment the processor is started, so changes made before that are not captured. An invalidate event, which the server "
+        + "sends when the watched collection is dropped or renamed, is written like any other event and the stream continues after it. "
+        + "When the server is unreachable the processor waits longer after every failed attempt, up to a minute, and continues from the "
+        + "last committed position once the server answers again.")
 @Stateful(scopes = Scope.CLUSTER, description = "The resume token of the last change event written to a FlowFile is stored so that the "
-        + "processor resumes from the same position after a restart or a change of the primary node. Clear the state to start over; "
-        + "the state is not valid for a different database or collection.")
+        + "processor resumes from the same position after a restart or a change of the primary node, together with the scope the token "
+        + "belongs to. A token is meaningless for another scope, database or collection, so the processor refuses to start when those "
+        + "change and asks for the state to be cleared.")
 @WritesAttributes({
         @WritesAttribute(attribute = CaptureChangeMongoDB.ATTRIBUTE_DATABASE, description = "Database the events belong to"),
         @WritesAttribute(attribute = CaptureChangeMongoDB.ATTRIBUTE_COLLECTION, description = "Collection the events belong to"),
@@ -108,6 +119,43 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     private static final long MAXIMUM_BACKOFF_MILLIS = 60_000L;
     private static final long REPEATED_FAILURE_LOG_INTERVAL_MILLIS = 60_000L;
 
+    private static final List<String> REQUIRED_ACTIONS = List.of("changeStream", "find");
+    private static final List<String> WRITE_ACTIONS =
+            List.of("insert", "update", "remove", "dropCollection", "dropDatabase", "createCollection", "collMod", "renameCollectionSameDB");
+
+    /** The stages MongoDB accepts in the pipeline of a change stream. */
+    static final List<String> ALLOWED_STAGES =
+            List.of("$match", "$project", "$addFields", "$set", "$unset", "$replaceRoot", "$replaceWith");
+
+    static final AllowableValue START_POSITION_NOW = new AllowableValue("now", "Now",
+            "Start with the changes made from the moment the processor is started. Changes made before that are not captured.");
+    static final AllowableValue START_POSITION_TIMESTAMP = new AllowableValue("timestamp", "Timestamp",
+            "Start with the changes made from the given point in time, as far back as the oplog of the server reaches.");
+
+    // The values are the ones the server understands, so that the driver enum can be built straight from them.
+    static final AllowableValue FULL_DOCUMENT_DEFAULT = new AllowableValue("default", "Default",
+            "Update events carry only the changed fields.");
+    static final AllowableValue FULL_DOCUMENT_UPDATE_LOOKUP = new AllowableValue("updateLookup", "Update Lookup",
+            "Update events also carry the document as it is when the event is read, which is not necessarily how it was right after "
+                    + "the change. Costs one read per event on the server.");
+    static final AllowableValue FULL_DOCUMENT_WHEN_AVAILABLE = new AllowableValue("whenAvailable", "When Available",
+            "Update events carry the document as it was right after the change when the collection keeps post-images, and nothing "
+                    + "when it does not.");
+    static final AllowableValue FULL_DOCUMENT_REQUIRED = new AllowableValue("required", "Required",
+            "Like When Available, but the server reports an error instead of sending an event without the document.");
+
+    static final AllowableValue BEFORE_CHANGE_OFF = new AllowableValue("off", "Off",
+            "The version before the change is never sent.");
+    static final AllowableValue BEFORE_CHANGE_WHEN_AVAILABLE = new AllowableValue("whenAvailable", "When Available",
+            "The version before the change is sent when the collection keeps pre-images, and left out when it does not.");
+    static final AllowableValue BEFORE_CHANGE_REQUIRED = new AllowableValue("required", "Required",
+            "Like When Available, but the server reports an error instead of sending an event without the earlier version.");
+
+    static final AllowableValue EXTENDED_JSON_RELAXED = new AllowableValue("relaxed", "Relaxed",
+            "Readable JSON: numbers and strings look like JSON numbers and strings.");
+    static final AllowableValue EXTENDED_JSON_CANONICAL = new AllowableValue("canonical", "Canonical",
+            "Every BSON type is written with its type, for example {\"$numberInt\": \"7\"}, so nothing is lost.");
+
     static final AllowableValue HISTORY_LOST_FAIL = new AllowableValue("fail", "Fail",
             "Report an error and keep the stored resume token. The flow stops making progress until an administrator decides what to do, "
                     + "so that no change is passed over without anyone noticing.");
@@ -123,9 +171,19 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
             .required(true)
             .build();
 
+    static final PropertyDescriptor WATCH_SCOPE = new PropertyDescriptor.Builder()
+            .name("Watch Scope")
+            .description("Whether to capture the changes of one collection or of every collection of a database. Changing this, the "
+                    + "database or the collection makes the stored resume token meaningless, so the processor state has to be cleared "
+                    + "before the processor starts again.")
+            .required(true)
+            .allowableValues(WatchScope.class)
+            .defaultValue(WatchScope.COLLECTION)
+            .build();
+
     static final PropertyDescriptor DATABASE_NAME = new PropertyDescriptor.Builder()
             .name("Database Name")
-            .description("Name of the database that holds the collection to watch.")
+            .description("Name of the database to watch.")
             .required(true)
             .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.ENVIRONMENT)
@@ -137,6 +195,64 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
             .required(true)
             .addValidator(StandardValidators.NON_BLANK_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.ENVIRONMENT)
+            .dependsOn(WATCH_SCOPE, WatchScope.COLLECTION)
+            .build();
+
+    static final PropertyDescriptor PIPELINE = new PropertyDescriptor.Builder()
+            .name("Pipeline")
+            .description("An aggregation pipeline the server applies to the change events before sending them, as a JSON array, for "
+                    + "example [{\"$match\": {\"operationType\": \"insert\"}}]. The work happens on the server, so events that do not "
+                    + "match never travel. MongoDB allows only these stages on a change stream: " + String.join(", ", ALLOWED_STAGES)
+                    + ". The pipeline sees the change event, not the document, so a condition on a field of the document reads like "
+                    + "{\"fullDocument.status\": \"open\"}.")
+            .required(false)
+            .addValidator(CaptureChangeMongoDB::validatePipeline)
+            .build();
+
+    static final PropertyDescriptor START_POSITION = new PropertyDescriptor.Builder()
+            .name("Start Position")
+            .description("Where the stream starts when there is no stored resume token. Once a token is stored this is ignored, and the "
+                    + "processor always continues from the stored position.")
+            .required(true)
+            .allowableValues(START_POSITION_NOW, START_POSITION_TIMESTAMP)
+            .defaultValue(START_POSITION_NOW.getValue())
+            .build();
+
+    static final PropertyDescriptor START_TIMESTAMP = new PropertyDescriptor.Builder()
+            .name("Start Timestamp")
+            .description("The point in time the stream starts at, in seconds since the epoch. The server can only start there while its "
+                    + "oplog still reaches back that far.")
+            .required(true)
+            .addValidator(StandardValidators.POSITIVE_LONG_VALIDATOR)
+            .dependsOn(START_POSITION, START_POSITION_TIMESTAMP)
+            .build();
+
+    static final PropertyDescriptor FULL_DOCUMENT = new PropertyDescriptor.Builder()
+            .name("Full Document")
+            .description("Whether the current version of the changed document is sent with an update event. Insert and replace events "
+                    + "always carry the document; delete events never do.")
+            .required(true)
+            .allowableValues(FULL_DOCUMENT_DEFAULT, FULL_DOCUMENT_UPDATE_LOOKUP, FULL_DOCUMENT_WHEN_AVAILABLE, FULL_DOCUMENT_REQUIRED)
+            .defaultValue(FULL_DOCUMENT_DEFAULT.getValue())
+            .build();
+
+    static final PropertyDescriptor FULL_DOCUMENT_BEFORE_CHANGE = new PropertyDescriptor.Builder()
+            .name("Full Document Before Change")
+            .description("Whether the version of the document before the change is sent with update, replace and delete events. The "
+                    + "server only has it for collections where pre-images are turned on, which is a change a database administrator "
+                    + "makes: db.runCommand({collMod: \"<collection>\", changeStreamPreAndPostImages: {enabled: true}}).")
+            .required(true)
+            .allowableValues(BEFORE_CHANGE_OFF, BEFORE_CHANGE_WHEN_AVAILABLE, BEFORE_CHANGE_REQUIRED)
+            .defaultValue(BEFORE_CHANGE_OFF.getValue())
+            .build();
+
+    static final PropertyDescriptor EXTENDED_JSON_MODE = new PropertyDescriptor.Builder()
+            .name("Extended JSON Mode")
+            .description("How the documents are written into the record fields. Relaxed is easier to read and turns numbers into JSON "
+                    + "numbers; Canonical keeps every BSON type exactly, so the value can be converted back without loss.")
+            .required(true)
+            .allowableValues(EXTENDED_JSON_RELAXED, EXTENDED_JSON_CANONICAL)
+            .defaultValue(EXTENDED_JSON_RELAXED.getValue())
             .build();
 
     static final PropertyDescriptor MAX_EVENTS_PER_FLOWFILE = new PropertyDescriptor.Builder()
@@ -190,8 +306,15 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             CLIENT_SERVICE,
+            WATCH_SCOPE,
             DATABASE_NAME,
             COLLECTION_NAME,
+            PIPELINE,
+            START_POSITION,
+            START_TIMESTAMP,
+            FULL_DOCUMENT,
+            FULL_DOCUMENT_BEFORE_CHANGE,
+            EXTENDED_JSON_MODE,
             MAX_EVENTS_PER_FLOWFILE,
             MAX_BATCH_DURATION,
             MAX_AWAIT_TIME,
@@ -221,6 +344,7 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     private volatile String committedToken;
 
     private volatile String onHistoryLost;
+    private volatile String streamSource;
 
     private long backoffMillis;
     private long nextAttemptMillis;
@@ -240,15 +364,16 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     @OnScheduled
     public void onScheduled(final ProcessContext context) throws IOException {
         final MongoDBClientService clientService = context.getProperty(CLIENT_SERVICE).asControllerService(MongoDBClientService.class);
-        final String databaseName = context.getProperty(DATABASE_NAME).evaluateAttributeExpressions().getValue();
-        final String collectionName = context.getProperty(COLLECTION_NAME).evaluateAttributeExpressions().getValue();
-        final long maxAwaitTimeMillis = context.getProperty(MAX_AWAIT_TIME).asTimePeriod(TimeUnit.MILLISECONDS);
+        final StreamOptions options = buildStreamOptions(context);
 
-        streamOpener = new StreamOpener(clientService, databaseName, collectionName, maxAwaitTimeMillis);
-        eventMapper = new EventMapper(JsonWriterSettings.builder().outputMode(JsonMode.RELAXED).build());
+        streamOpener = new StreamOpener(clientService, options);
+        eventMapper = new EventMapper(JsonWriterSettings.builder().outputMode(extendedJsonMode(context)).build());
         writerFactory = context.getProperty(RECORD_WRITER).asControllerService(RecordSetWriterFactory.class);
-        namespaceAttributes = Map.of(ATTRIBUTE_DATABASE, databaseName, ATTRIBUTE_COLLECTION, collectionName);
-        transitUri = buildTransitUri(clientService.getURI(), databaseName, collectionName);
+        namespaceAttributes = options.scope() == WatchScope.COLLECTION
+                ? Map.of(ATTRIBUTE_DATABASE, options.databaseName(), ATTRIBUTE_COLLECTION, options.collectionName())
+                : Map.of(ATTRIBUTE_DATABASE, options.databaseName());
+        transitUri = buildTransitUri(clientService.getURI(), options);
+        streamSource = options.source();
         maxEventsPerFlowFile = context.getProperty(MAX_EVENTS_PER_FLOWFILE).asInteger();
         maxBatchDurationMillis = context.getProperty(MAX_BATCH_DURATION).asTimePeriod(TimeUnit.MILLISECONDS);
         onHistoryLost = context.getProperty(ON_HISTORY_LOST).getValue();
@@ -257,8 +382,77 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
         nextAttemptMillis = 0L;
         failing = false;
 
-        committedToken = context.getStateManager().getState(Scope.CLUSTER).get(StateKeys.RESUME_TOKEN);
+        final StateMap state = context.getStateManager().getState(Scope.CLUSTER);
+        committedToken = state.get(StateKeys.RESUME_TOKEN);
         resumeFrom = committedToken;
+
+        final String storedSource = state.get(StateKeys.STREAM_SOURCE);
+        if (committedToken != null && storedSource != null && !storedSource.equals(streamSource)) {
+            throw new ProcessException(String.format(
+                    "The stored position belongs to %s and cannot be used for %s. Clear the state of the processor to start watching "
+                            + "%s, keeping in mind that the changes made in the meantime are not captured.",
+                    storedSource, streamSource, streamSource));
+        }
+    }
+
+    private StreamOptions buildStreamOptions(final ProcessContext context) {
+        final WatchScope scope = context.getProperty(WATCH_SCOPE).asAllowableValue(WatchScope.class);
+        final String collectionName = scope == WatchScope.COLLECTION
+                ? context.getProperty(COLLECTION_NAME).evaluateAttributeExpressions().getValue()
+                : null;
+        final BsonTimestamp startAtOperationTime = START_POSITION_TIMESTAMP.getValue().equals(context.getProperty(START_POSITION).getValue())
+                ? new BsonTimestamp(context.getProperty(START_TIMESTAMP).asInteger(), 0)
+                : null;
+
+        return new StreamOptions(
+                scope,
+                context.getProperty(DATABASE_NAME).evaluateAttributeExpressions().getValue(),
+                collectionName,
+                parsePipeline(context.getProperty(PIPELINE).getValue()),
+                FullDocument.fromString(context.getProperty(FULL_DOCUMENT).getValue()),
+                FullDocumentBeforeChange.fromString(context.getProperty(FULL_DOCUMENT_BEFORE_CHANGE).getValue()),
+                startAtOperationTime,
+                context.getProperty(MAX_AWAIT_TIME).asTimePeriod(TimeUnit.MILLISECONDS));
+    }
+
+    private static JsonMode extendedJsonMode(final ProcessContext context) {
+        return EXTENDED_JSON_CANONICAL.getValue().equals(context.getProperty(EXTENDED_JSON_MODE).getValue())
+                ? JsonMode.EXTENDED
+                : JsonMode.RELAXED;
+    }
+
+    static List<BsonDocument> parsePipeline(final String pipeline) {
+        if (pipeline == null || pipeline.isBlank()) {
+            return List.of();
+        }
+        return BsonArray.parse(pipeline).stream().map(BsonValue::asDocument).toList();
+    }
+
+    private static ValidationResult validatePipeline(final String subject, final String input, final ValidationContext context) {
+        final ValidationResult.Builder result = new ValidationResult.Builder().subject(subject).input(input);
+        if (input == null || input.isBlank()) {
+            return result.valid(true).build();
+        }
+
+        final List<BsonValue> stages;
+        try {
+            stages = BsonArray.parse(input);
+        } catch (final Exception e) {
+            return result.valid(false).explanation("is not a JSON array of pipeline stages: " + e.getMessage()).build();
+        }
+
+        for (final BsonValue stage : stages) {
+            if (!stage.isDocument() || stage.asDocument().size() != 1) {
+                return result.valid(false).explanation("every stage must be an object with exactly one operator, for example "
+                        + "{\"$match\": {\"operationType\": \"insert\"}}").build();
+            }
+            final String operator = stage.asDocument().getFirstKey();
+            if (!ALLOWED_STAGES.contains(operator)) {
+                return result.valid(false).explanation(String.format("MongoDB does not allow %s on a change stream; allowed are %s",
+                        operator, String.join(", ", ALLOWED_STAGES))).build();
+            }
+        }
+        return result.valid(true).build();
     }
 
     @OnStopped
@@ -360,7 +554,7 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     }
 
     private void commit(final ProcessSession session, final String resumeToken) throws IOException {
-        session.setState(Map.of(StateKeys.RESUME_TOKEN, resumeToken), Scope.CLUSTER);
+        session.setState(Map.of(StateKeys.RESUME_TOKEN, resumeToken, StateKeys.STREAM_SOURCE, streamSource), Scope.CLUSTER);
         session.commitAsync(() -> {
             committedToken = resumeToken;
             resumeFrom = resumeToken;
@@ -512,7 +706,115 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
 
         results.add(verifyDeployment(hello));
         results.add(verifyServerVersion(clientService, databaseName, verificationLogger));
+        results.add(verifyPrivileges(clientService, context, verificationLogger));
+
+        final StreamOptions options = buildStreamOptions(context);
+        if (options.fullDocumentBeforeChange() != FullDocumentBeforeChange.OFF) {
+            results.add(verifyPreImages(clientService, options, verificationLogger));
+        }
         return results;
+    }
+
+    /**
+     * The processor only reads, so the user needs changeStream and find on the watched scope and nothing more. A user
+     * that may also write is not an error, but it is worth saying out loud.
+     */
+    private ConfigVerificationResult verifyPrivileges(final MongoDBClientService clientService, final ProcessContext context,
+                                                      final ComponentLog verificationLogger) {
+        final String step = "Privileges sufficient";
+        final StreamOptions options = buildStreamOptions(context);
+
+        final Document authInfo;
+        try {
+            authInfo = clientService.getDatabase("admin")
+                    .runCommand(new Document("connectionStatus", 1).append("showPrivileges", true))
+                    .get("authInfo", Document.class);
+        } catch (final Exception e) {
+            verificationLogger.warn("Reading the privileges of the user failed", e);
+            return result(step, ConfigVerificationResult.Outcome.SKIPPED,
+                    String.format("Could not read the privileges of the user: %s", e.getMessage()));
+        }
+
+        final List<Document> users = authInfo == null ? List.of() : authInfo.getList("authenticatedUsers", Document.class, List.of());
+        if (users.isEmpty()) {
+            return result(step, ConfigVerificationResult.Outcome.SKIPPED,
+                    "The connection is not authenticated, so the server applies no privileges");
+        }
+
+        final Set<String> actions = new HashSet<>();
+        for (final Document privilege : authInfo.getList("authenticatedUserPrivileges", Document.class, List.of())) {
+            if (coversWatchedScope(privilege.get("resource", Document.class), options)) {
+                actions.addAll(privilege.getList("actions", String.class, List.of()));
+            }
+        }
+
+        final List<String> missing = REQUIRED_ACTIONS.stream().filter(action -> !actions.contains(action)).toList();
+        if (!missing.isEmpty()) {
+            return result(step, ConfigVerificationResult.Outcome.FAILED,
+                    String.format("The user is missing %s on %s", String.join(" and ", missing), options.source()));
+        }
+
+        final List<String> writeActions = WRITE_ACTIONS.stream().filter(actions::contains).toList();
+        if (!writeActions.isEmpty()) {
+            return result(step, ConfigVerificationResult.Outcome.SUCCESSFUL,
+                    String.format("changeStream and find are granted. The user may also write to the source (%s); the processor never "
+                            + "does, but a read-only user is the safer choice", String.join(", ", writeActions)));
+        }
+        return result(step, ConfigVerificationResult.Outcome.SUCCESSFUL, "changeStream and find are granted, and the user cannot write");
+    }
+
+    private static boolean coversWatchedScope(final Document resource, final StreamOptions options) {
+        if (resource == null) {
+            return false;
+        }
+        if (Boolean.TRUE.equals(resource.getBoolean("anyResource"))) {
+            return true;
+        }
+        final String database = resource.getString("db");
+        final String collection = resource.getString("collection");
+        if (database == null || collection == null) {
+            return false;
+        }
+        // An empty name stands for every database or every collection.
+        final boolean databaseMatches = database.isEmpty() || database.equals(options.databaseName());
+        final boolean collectionMatches = collection.isEmpty()
+                || (options.scope() == WatchScope.COLLECTION && collection.equals(options.collectionName()));
+        return databaseMatches && collectionMatches;
+    }
+
+    /**
+     * The version before the change only exists for collections where a database administrator turned pre-images on.
+     */
+    private ConfigVerificationResult verifyPreImages(final MongoDBClientService clientService, final StreamOptions options,
+                                                     final ComponentLog verificationLogger) {
+        final String step = "Pre-images available";
+        if (options.scope() != WatchScope.COLLECTION) {
+            return result(step, ConfigVerificationResult.Outcome.SKIPPED,
+                    "With database scope every collection needs pre-images of its own, which is not checked here");
+        }
+
+        try {
+            final Document collectionInfo = clientService.getDatabase(options.databaseName()).listCollections()
+                    .filter(new Document("name", options.collectionName())).first();
+            if (collectionInfo == null) {
+                return result(step, ConfigVerificationResult.Outcome.FAILED,
+                        String.format("The collection %s does not exist", options.source()));
+            }
+
+            final Document collectionOptions = collectionInfo.get("options", Document.class);
+            final Document preImages = collectionOptions == null ? null : collectionOptions.get("changeStreamPreAndPostImages", Document.class);
+            if (preImages == null || !Boolean.TRUE.equals(preImages.getBoolean("enabled"))) {
+                return result(step, ConfigVerificationResult.Outcome.FAILED, String.format(
+                        "Full Document Before Change is set, but the collection does not keep pre-images. A database administrator turns "
+                                + "them on with db.runCommand({collMod: \"%s\", changeStreamPreAndPostImages: {enabled: true}}); only "
+                                + "changes made after that have a pre-image.", options.collectionName()));
+            }
+            return result(step, ConfigVerificationResult.Outcome.SUCCESSFUL, "The collection keeps pre-images");
+        } catch (final Exception e) {
+            verificationLogger.warn("Reading the collection options failed", e);
+            return result(step, ConfigVerificationResult.Outcome.SKIPPED,
+                    String.format("Could not read the options of the collection: %s", e.getMessage()));
+        }
     }
 
     private ConfigVerificationResult verifyDeployment(final Document hello) {
@@ -560,11 +862,14 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     /**
      * The connection string without any credentials that may be embedded in it, so that provenance never carries a password.
      */
-    private static String buildTransitUri(final String uri, final String databaseName, final String collectionName) {
+    private static String buildTransitUri(final String uri, final StreamOptions options) {
         final String withoutCredentials = uri == null ? "" : uri.replaceAll("://[^@/]*@", "://");
         final String withoutTrailingSlash = withoutCredentials.endsWith("/")
                 ? withoutCredentials.substring(0, withoutCredentials.length() - 1)
                 : withoutCredentials;
-        return String.format("%s/%s.%s", withoutTrailingSlash, databaseName, collectionName);
+        final String namespace = options.scope() == WatchScope.COLLECTION
+                ? String.format("%s.%s", options.databaseName(), options.collectionName())
+                : options.databaseName();
+        return String.format("%s/%s", withoutTrailingSlash, namespace);
     }
 }

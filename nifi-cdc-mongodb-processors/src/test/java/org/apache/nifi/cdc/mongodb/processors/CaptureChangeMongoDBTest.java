@@ -45,6 +45,7 @@ import java.util.stream.Stream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -296,6 +297,80 @@ class CaptureChangeMongoDBTest {
         runner.run(1, false, false);
         runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 2);
         runner.getStateManager().assertStateEquals(StateKeys.RESUME_TOKEN, "t2", Scope.CLUSTER);
+    }
+
+    @Test
+    void aPipelineIsCheckedAgainstWhatMongoDBAllowsOnAChangeStream() throws Exception {
+        processor.addCursor(cursor(INITIAL_TOKEN));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+
+        runner.setProperty(CaptureChangeMongoDB.PIPELINE, "[{\"$match\": {\"operationType\": \"insert\"}}]");
+        runner.assertValid();
+
+        runner.setProperty(CaptureChangeMongoDB.PIPELINE, "[{\"$match\": {\"operationType\": \"insert\"}}, {\"$project\": {\"ns\": 1}}]");
+        runner.assertValid();
+
+        runner.setProperty(CaptureChangeMongoDB.PIPELINE, "[{\"$group\": {\"_id\": \"$ns\"}}]");
+        runner.assertNotValid();
+
+        runner.setProperty(CaptureChangeMongoDB.PIPELINE, "{\"$match\": {}}");
+        runner.assertNotValid();
+
+        runner.setProperty(CaptureChangeMongoDB.PIPELINE, "[{\"$match\": {}, \"$project\": {}}]");
+        runner.assertNotValid();
+
+        runner.setProperty(CaptureChangeMongoDB.PIPELINE, "not json");
+        runner.assertNotValid();
+    }
+
+    @Test
+    void collectionNameIsNotAskedForWithDatabaseScope() throws Exception {
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+        runner.removeProperty(CaptureChangeMongoDB.COLLECTION_NAME);
+        runner.setProperty(CaptureChangeMongoDB.WATCH_SCOPE, WatchScope.DATABASE);
+        runner.assertValid();
+
+        runner.run();
+
+        final MockFlowFile flowFile = runner.getFlowFilesForRelationship(CaptureChangeMongoDB.REL_SUCCESS).getFirst();
+        flowFile.assertAttributeEquals(CaptureChangeMongoDB.ATTRIBUTE_DATABASE, "lab");
+        flowFile.assertAttributeNotExists(CaptureChangeMongoDB.ATTRIBUTE_COLLECTION);
+    }
+
+    /**
+     * A resume token belongs to the scope it was read from. Continuing with it somewhere else would silently read
+     * the wrong changes, so the processor refuses to start and says what to do.
+     */
+    @Test
+    void aStoredPositionFromAnotherScopeStopsTheProcessor() throws Exception {
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+        runner.getStateManager().setState(
+                Map.of(StateKeys.RESUME_TOKEN, "stored-token", StateKeys.STREAM_SOURCE, "collection:lab.invoices"), Scope.CLUSTER);
+
+        final Throwable failure = assertThrows(Throwable.class, runner::run);
+        assertTrue(messageOf(failure).contains("collection:lab.invoices"), messageOf(failure));
+        assertTrue(messageOf(failure).contains("Clear the state"), messageOf(failure));
+        assertEquals(List.of(), processor.openedFrom, "the stream must not be opened at all");
+    }
+
+    @Test
+    void theScopeTheTokenBelongsToIsStoredWithIt() throws Exception {
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+
+        runner.run();
+
+        runner.getStateManager().assertStateEquals(StateKeys.STREAM_SOURCE, "collection:lab.orders", Scope.CLUSTER);
+    }
+
+    private static String messageOf(final Throwable failure) {
+        final StringBuilder messages = new StringBuilder();
+        for (Throwable current = failure; current != null; current = current.getCause()) {
+            messages.append(current.getMessage()).append(' ');
+        }
+        return messages.toString();
     }
 
     private TestRunner createRunner(final MockRecordWriter writer) throws InitializationException {

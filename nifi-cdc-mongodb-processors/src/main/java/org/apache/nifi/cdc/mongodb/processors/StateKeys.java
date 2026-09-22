@@ -21,6 +21,9 @@ final class StateKeys {
     /** The {@code _data} string of the resume token of the last change event written to a committed FlowFile. */
     static final String RESUME_TOKEN = "resume.token";
 
+    /** What the stored resume token belongs to, so that it is never used for a different scope; see StreamOptions. */
+    static final String STREAM_SOURCE = "stream.source";
+
     private StateKeys() {
     }
 }

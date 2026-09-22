@@ -25,8 +25,22 @@ All notable changes to this project are recorded here. The format follows
   made from then on.
 - After a failed attempt the processor waits before trying again, doubling the wait up to a minute and
   giving it up as soon as a trigger succeeds, so an unreachable server is not asked on every trigger.
-- `verify` checks the connection, that the server is a replica set or a sharded cluster, and that it is
-  MongoDB 6.0 or later.
+- `Watch Scope` captures either one collection or every collection of a database. With database scope every
+  record names the collection it belongs to, and collections created while the processor runs are captured
+  as well.
+- `Pipeline` takes an aggregation pipeline that the server applies before sending the events, so events
+  that do not match never travel. Only the stages MongoDB allows on a change stream are accepted, and the
+  pipeline is checked while the processor is configured.
+- `Start Position` decides where a stream without a stored position starts: at the moment the processor is
+  started, or at a given point in time.
+- `Full Document` and `Full Document Before Change` decide whether an update event carries the document and
+  the version before the change.
+- `Extended JSON Mode` writes the documents either readable or with every BSON type kept.
+- The scope a stored resume token belongs to is stored with it. A token from another scope, database or
+  collection is refused with a message saying to clear the state, instead of reading the wrong changes.
+- `verify` checks the connection, that the server is a replica set or a sharded cluster, that it is MongoDB
+  6.0 or later, that the user has `changeStream` and `find` on the watched scope (and warns when the user
+  may also write), and that the collection keeps pre-images when they are asked for.
 - Maven skeleton with the `nifi-cdc-mongodb-processors` and `nifi-cdc-mongodb-nar` modules, parented to
   `org.apache.nifi:nifi-cdc`, so the bundle can move into `apache/nifi` unchanged.
 - GitHub Actions workflows for build and release, and the upstream RAT, checkstyle and PMD checks through
@@ -36,6 +50,6 @@ All notable changes to this project are recorded here. The format follows
 
 ### Known limitations
 
-- Collection scope only. Database scope, the aggregation pipeline, the full document options and
-  `Start Position` follow.
 - Deployment scope is not possible through the current `MongoDBClientService`; see `docs/prior-art.md`.
+- No initial snapshot yet, so a new flow starts with the changes and not with the documents that are
+  already there.

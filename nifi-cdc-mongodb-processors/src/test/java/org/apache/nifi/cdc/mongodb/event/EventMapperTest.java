@@ -159,6 +159,30 @@ class EventMapperTest {
         assertArrayEquals(new Object[0], record.getAsArray(EventMapper.FIELD_REMOVED_FIELDS));
     }
 
+    /**
+     * Canonical mode writes every BSON type with its name, so a consumer can turn the string back into the exact
+     * document. Relaxed mode drops that for readability.
+     */
+    @Test
+    void canonicalModeKeepsTheBsonTypes() {
+        final String event = """
+                {
+                  "_id": {"_data": "%s"},
+                  "operationType": "insert",
+                  "clusterTime": {"$timestamp": {"t": 1700000000, "i": 1}},
+                  "ns": {"db": "lab", "coll": "orders"},
+                  "documentKey": {"_id": 7},
+                  "fullDocument": {"_id": 7, "total": 42}
+                }
+                """.formatted(RESUME_TOKEN);
+
+        final EventMapper canonical = new EventMapper(JsonWriterSettings.builder().outputMode(JsonMode.EXTENDED).build());
+        assertEquals("{\"_id\": {\"$numberInt\": \"7\"}, \"total\": {\"$numberInt\": \"42\"}}",
+                canonical.map(ChangeEvents.decode(event)).getValue(EventMapper.FIELD_FULL_DOCUMENT));
+
+        assertEquals("{\"_id\": 7, \"total\": 42}", map(event).getValue(EventMapper.FIELD_FULL_DOCUMENT));
+    }
+
     @Test
     void clusterTimePacksSecondsAndIncrementSoThatItSorts() {
         assertEquals((1700000000L << 32) | 3L, EventMapper.clusterTime(new BsonTimestamp(1700000000, 3)));

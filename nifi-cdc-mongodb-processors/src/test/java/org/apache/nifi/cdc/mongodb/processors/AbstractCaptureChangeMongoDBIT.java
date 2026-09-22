@@ -41,6 +41,7 @@ import org.testcontainers.DockerClientFactory;
 import org.testcontainers.mongodb.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -329,13 +330,135 @@ abstract class AbstractCaptureChangeMongoDBIT {
     }
 
     @Test
-    void verifyReportsTheConnectionTheDeploymentAndTheVersion() {
+    void databaseScopeCapturesEveryCollectionOfTheDatabase() {
+        runner.removeProperty(CaptureChangeMongoDB.COLLECTION_NAME);
+        runner.setProperty(CaptureChangeMongoDB.WATCH_SCOPE, WatchScope.DATABASE);
+        startStream();
+
+        collection.insertOne(new Document("_id", 1));
+        client.getDatabase(DATABASE).getCollection("invoices").insertOne(new Document("_id", 2));
+
+        final List<Document> records = readRecords(2);
+
+        assertEquals(List.of(COLLECTION, "invoices"), records.stream().map(record -> record.getString("collection")).toList());
+        records.forEach(record -> assertEquals(DATABASE, record.getString("database")));
+    }
+
+    /**
+     * The pipeline runs on the server, so the events it drops never reach the processor. Nothing is filtered here,
+     * which is why seeing only the matching events proves the server did the work.
+     */
+    @Test
+    void aPipelineKeepsTheUnwantedEventsOnTheServer() {
+        runner.setProperty(CaptureChangeMongoDB.PIPELINE, "[{\"$match\": {\"operationType\": \"delete\"}}]");
+        startStream();
+
+        for (int id = 1; id <= 5; id++) {
+            collection.insertOne(new Document("_id", id));
+        }
+        collection.deleteOne(Filters.eq("_id", 3));
+
+        final List<Document> records = readRecords(1);
+
+        assertEquals(1, records.size(), "only the delete may arrive, the five inserts must be dropped by the server");
+        assertEquals("delete", records.getFirst().getString("operation"));
+        assertEquals("{\"_id\": 3}", records.getFirst().getString("document_key"));
+    }
+
+    @Test
+    void updateLookupAddsTheDocumentToAnUpdateEvent() {
+        runner.setProperty(CaptureChangeMongoDB.FULL_DOCUMENT, CaptureChangeMongoDB.FULL_DOCUMENT_UPDATE_LOOKUP.getValue());
+        startStream();
+
+        collection.insertOne(new Document("_id", 1).append("total", 10));
+        collection.updateOne(Filters.eq("_id", 1), Updates.set("total", 20));
+
+        final List<Document> records = readRecords(2);
+        assertEquals("update", records.get(1).getString("operation"));
+        assertEquals("{\"total\": 20}", records.get(1).getString("updated_fields"));
+        assertEquals("{\"_id\": 1, \"total\": 20}", records.get(1).getString("full_document"));
+    }
+
+    /**
+     * The version before the change only exists where the collection keeps pre-images; turning them on is a change
+     * a database administrator makes, never the processor.
+     */
+    @Test
+    void preImagesAreDeliveredWhenTheCollectionKeepsThem() {
+        client.getDatabase(DATABASE).runCommand(new Document("collMod", COLLECTION)
+                .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+        runner.setProperty(CaptureChangeMongoDB.FULL_DOCUMENT_BEFORE_CHANGE, CaptureChangeMongoDB.BEFORE_CHANGE_REQUIRED.getValue());
+        startStream();
+
+        collection.insertOne(new Document("_id", 1).append("total", 10));
+        collection.updateOne(Filters.eq("_id", 1), Updates.set("total", 20));
+
+        final List<Document> records = readRecords(2);
+        assertEquals("{\"_id\": 1, \"total\": 10}", records.get(1).getString("full_document_before_change"));
+    }
+
+    @Test
+    void canonicalModeKeepsTheBsonTypes() {
+        runner.setProperty(CaptureChangeMongoDB.EXTENDED_JSON_MODE, CaptureChangeMongoDB.EXTENDED_JSON_CANONICAL.getValue());
+        startStream();
+
+        collection.insertOne(new Document("_id", 1).append("total", 42));
+
+        final List<Document> records = readRecords(1);
+        assertEquals("{\"_id\": {\"$numberInt\": \"1\"}, \"total\": {\"$numberInt\": \"42\"}}",
+                records.getFirst().getString("full_document"));
+    }
+
+    /**
+     * Start Position Timestamp reaches back into the oplog, so changes made before the processor was ever started
+     * are captured.
+     */
+    @Test
+    void startPositionTimestampReadsTheChangesMadeBeforeTheFirstStart() throws Exception {
+        // The property has a resolution of one second, so the next second is waited for; otherwise the changes made
+        // while the test was setting up would fall on the start position as well.
+        final long startSeconds = Instant.now().getEpochSecond() + 1;
+        Thread.sleep(Math.max(0L, startSeconds * 1000L - System.currentTimeMillis()) + 100L);
+
+        collection.insertOne(new Document("_id", "made-before-the-first-start"));
+
+        runner.setProperty(CaptureChangeMongoDB.START_POSITION, CaptureChangeMongoDB.START_POSITION_TIMESTAMP.getValue());
+        runner.setProperty(CaptureChangeMongoDB.START_TIMESTAMP, Long.toString(startSeconds));
+
+        runner.run(1, false, true);
+        final List<Document> records = readRecords(1);
+
+        assertEquals(1, records.size());
+        assertEquals("{\"_id\": \"made-before-the-first-start\"}", records.getFirst().getString("document_key"));
+    }
+
+    @Test
+    void verifyReportsTheConnectionTheDeploymentTheVersionAndThePrivileges() {
         final List<ConfigVerificationResult> results =
                 ((CaptureChangeMongoDB) runner.getProcessor()).verify(runner.getProcessContext(), runner.getLogger(), Map.of());
 
-        assertEquals(3, results.size());
-        results.forEach(result -> assertEquals(ConfigVerificationResult.Outcome.SUCCESSFUL, result.getOutcome(),
+        assertEquals(List.of("Connect to MongoDB", "Change Streams available", "Server version supported", "Privileges sufficient"),
+                results.stream().map(ConfigVerificationResult::getVerificationStepName).toList());
+        results.forEach(result -> assertNotEquals(ConfigVerificationResult.Outcome.FAILED, result.getOutcome(),
                 result.getVerificationStepName() + ": " + result.getExplanation()));
+    }
+
+    /**
+     * Asking for the version before the change on a collection that does not keep pre-images is a configuration
+     * mistake the check has to catch, because the server would only fail later, event by event.
+     */
+    @Test
+    void verifyReportsAMissingPreImageConfiguration() {
+        runner.setProperty(CaptureChangeMongoDB.FULL_DOCUMENT_BEFORE_CHANGE, CaptureChangeMongoDB.BEFORE_CHANGE_REQUIRED.getValue());
+
+        final List<ConfigVerificationResult> results =
+                ((CaptureChangeMongoDB) runner.getProcessor()).verify(runner.getProcessContext(), runner.getLogger(), Map.of());
+
+        final ConfigVerificationResult preImages = results.stream()
+                .filter(result -> "Pre-images available".equals(result.getVerificationStepName()))
+                .findFirst().orElseThrow();
+        assertEquals(ConfigVerificationResult.Outcome.FAILED, preImages.getOutcome());
+        assertTrue(preImages.getExplanation().contains("collMod"), preImages.getExplanation());
     }
 
     /**

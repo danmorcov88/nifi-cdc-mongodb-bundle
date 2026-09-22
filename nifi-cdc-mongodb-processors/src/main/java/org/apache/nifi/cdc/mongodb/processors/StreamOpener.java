@@ -26,36 +26,42 @@ import org.bson.BsonDocument;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Opens the change stream cursor for the watched collection. Without a resume token the stream starts at the
- * current moment; with one it continues after the event the token belongs to.
+ * Opens the change stream cursor for the watched scope. A stored resume token decides where the stream starts;
+ * without one it starts at the configured point in time, or at the current moment.
  */
 class StreamOpener {
 
     private final MongoDBClientService clientService;
-    private final String databaseName;
-    private final String collectionName;
-    private final long maxAwaitTimeMillis;
+    private final StreamOptions options;
 
-    StreamOpener(final MongoDBClientService clientService, final String databaseName, final String collectionName, final long maxAwaitTimeMillis) {
+    StreamOpener(final MongoDBClientService clientService, final StreamOptions options) {
         this.clientService = clientService;
-        this.databaseName = databaseName;
-        this.collectionName = collectionName;
-        this.maxAwaitTimeMillis = maxAwaitTimeMillis;
+        this.options = options;
     }
 
     MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> open(final String resumeTokenData) {
-        ChangeStreamIterable<BsonDocument> stream = clientService.getDatabase(databaseName)
-                .getCollection(collectionName, BsonDocument.class)
-                .watch();
+        ChangeStreamIterable<BsonDocument> stream = switch (options.scope()) {
+            case COLLECTION -> clientService.getDatabase(options.databaseName())
+                    .getCollection(options.collectionName(), BsonDocument.class)
+                    .watch(options.pipeline());
+            case DATABASE -> clientService.getDatabase(options.databaseName())
+                    .watch(options.pipeline(), BsonDocument.class);
+        };
 
         final BsonDocument resumeToken = EventMapper.resumeToken(resumeTokenData);
         if (resumeToken != null) {
             // startAfter continues from the token like resumeAfter, and unlike resumeAfter it also works when the
             // token belongs to an invalidate event, so the stream survives a dropped or renamed collection.
             stream = stream.startAfter(resumeToken);
+        } else if (options.startAtOperationTime() != null) {
+            stream = stream.startAtOperationTime(options.startAtOperationTime());
         }
 
-        // Bounds how long tryNext() waits on an idle stream, so that a trigger returns promptly.
-        return stream.maxAwaitTime(maxAwaitTimeMillis, TimeUnit.MILLISECONDS).cursor();
+        return stream
+                .fullDocument(options.fullDocument())
+                .fullDocumentBeforeChange(options.fullDocumentBeforeChange())
+                // Bounds how long tryNext() waits on an idle stream, so that a trigger returns promptly.
+                .maxAwaitTime(options.maxAwaitTimeMillis(), TimeUnit.MILLISECONDS)
+                .cursor();
     }
 }
