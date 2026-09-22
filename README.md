@@ -25,11 +25,12 @@ intended as a contribution for [NIFI-7180](https://issues.apache.org/jira/browse
 ## Status
 
 **Work in progress.** The processor reads the change stream of a single collection and writes the events as
-records, resuming from the stored resume token after a restart. Covered by unit tests and by integration
+records, resuming from the stored resume token after a restart. It survives a dropped collection, an
+unreachable server and a position the server can no longer serve. Covered by unit tests and by integration
 tests against MongoDB 7.0 and 8.0.
 
 Not there yet: database scope, the aggregation pipeline, the full document and pre-image options,
-`Start Position`, the initial snapshot, and continuing after an `invalidate` event.
+`Start Position`, and the initial snapshot.
 
 ## Requirements
 

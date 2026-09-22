@@ -16,6 +16,8 @@
  */
 package org.apache.nifi.cdc.mongodb.processors;
 
+import com.github.dockerjava.api.DockerClient;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
@@ -35,15 +37,18 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.mongodb.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -57,6 +62,7 @@ abstract class AbstractCaptureChangeMongoDBIT {
     private static final String DATABASE = "lab";
     private static final String COLLECTION = "orders";
     private static final int MAX_TRIGGERS = 40;
+    private static final long RECOVERY_TIMEOUT_MILLIS = 90_000L;
 
     private MongoDBContainer container;
     private MongoClient client;
@@ -93,7 +99,9 @@ abstract class AbstractCaptureChangeMongoDBIT {
 
         final MongoDBControllerService clientService = new MongoDBControllerService();
         runner.addControllerService("client-service", clientService);
-        runner.setProperty(clientService, MongoDBClientService.URI, container.getReplicaSetUrl());
+        // Short timeouts, so that a server that does not answer fails the trigger instead of blocking it.
+        runner.setProperty(clientService, MongoDBClientService.URI,
+                container.getReplicaSetUrl() + "?connectTimeoutMS=2000&socketTimeoutMS=2000&serverSelectionTimeoutMS=2000");
         runner.enableControllerService(clientService);
 
         final JsonRecordSetWriter writer = new JsonRecordSetWriter();
@@ -180,6 +188,146 @@ abstract class AbstractCaptureChangeMongoDBIT {
         }
     }
 
+    /**
+     * Dropping the watched collection ends the stream with an invalidate. The events are delivered, and the stream
+     * carries on afterwards, so a collection that is dropped and created again keeps being captured.
+     */
+    @Test
+    void droppingTheCollectionInvalidatesTheStreamAndTheStreamCarriesOn() {
+        startStream();
+        collection.insertOne(new Document("_id", 1));
+        collection.drop();
+
+        final List<Document> beforeInvalidate = readUntil(record -> "invalidate".equals(record.getString("operation")));
+        final List<String> operations = beforeInvalidate.stream().map(record -> record.getString("operation")).toList();
+        assertEquals("insert", operations.getFirst());
+        assertEquals("invalidate", operations.getLast());
+
+        client.getDatabase(DATABASE).getCollection(COLLECTION).insertOne(new Document("_id", 2));
+
+        final List<Document> afterInvalidate = readRecords(1);
+        assertEquals(1, afterInvalidate.size());
+        assertEquals("insert", afterInvalidate.getFirst().getString("operation"));
+        assertEquals("{\"_id\": 2}", afterInvalidate.getFirst().getString("document_key"));
+    }
+
+    /**
+     * Every event of a multi document transaction carries the same transaction number, so a consumer can tell that
+     * they belong together.
+     */
+    @Test
+    void theEventsOfATransactionShareTheTransactionNumber() {
+        startStream();
+
+        try (ClientSession session = client.startSession()) {
+            session.startTransaction();
+            collection.insertOne(session, new Document("_id", 1));
+            collection.insertOne(session, new Document("_id", 2));
+            collection.insertOne(session, new Document("_id", 3));
+            session.commitTransaction();
+        }
+
+        final List<Document> records = readRecords(3);
+        assertEquals(3, records.size());
+
+        final List<Long> transactionNumbers = records.stream()
+                .map(record -> record.get("txn_number", Number.class))
+                .map(number -> number == null ? null : number.longValue())
+                .distinct()
+                .toList();
+        assertEquals(1, transactionNumbers.size(), "all events of the transaction must carry the same txn_number");
+        assertNotNull(transactionNumbers.getFirst(), "the events of a transaction must carry a txn_number");
+    }
+
+    /**
+     * While the server does not answer the processor keeps failing and waiting, and once it answers again it
+     * continues from the last committed position without losing a change.
+     */
+    @Test
+    void anOutageIsSurvivedWithoutLosingChanges() throws Exception {
+        startStream();
+        for (int id = 1; id <= 5; id++) {
+            collection.insertOne(new Document("_id", id));
+        }
+        assertEquals(5, readRecords(5).size());
+
+        final DockerClient docker = DockerClientFactory.instance().client();
+        docker.pauseContainerCmd(container.getContainerId()).exec();
+        try {
+            runner.run(1, false, false);
+            runner.run(1, false, false);
+            runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 0);
+        } finally {
+            docker.unpauseContainerCmd(container.getContainerId()).exec();
+        }
+
+        for (int id = 6; id <= 10; id++) {
+            collection.insertOne(new Document("_id", id));
+        }
+
+        final List<Document> records = readRecordsWaiting(5);
+        assertEquals(IntStream.rangeClosed(6, 10).boxed().toList(),
+                records.stream().map(record -> Document.parse(record.getString("document_key")).getInteger("_id")).toList());
+    }
+
+    /**
+     * A position the server cannot serve any more. With the default setting the stored token is kept and the
+     * problem is reported, so that nobody loses changes without noticing.
+     */
+    @Test
+    void aPositionTheServerCannotServeIsReportedAndKept() throws Exception {
+        final String lostToken = stopWithAPositionTheServerCannotServe();
+
+        runner.run(1, false, true);
+
+        runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 0);
+        assertEquals(lostToken, runner.getStateManager().getState(Scope.CLUSTER).get(StateKeys.RESUME_TOKEN),
+                "the stored position must be kept, so that the loss is not hidden");
+        assertTrue(runner.getLogger().getErrorMessages().stream()
+                        .anyMatch(message -> message.getMsg().contains("no longer in the oplog")),
+                "the operator must be told that the stored position is gone");
+    }
+
+    @Test
+    void aPositionTheServerCannotServeCanBeGivenUpToCarryOn() throws Exception {
+        final String lostToken = stopWithAPositionTheServerCannotServe();
+        runner.setProperty(CaptureChangeMongoDB.ON_HISTORY_LOST, CaptureChangeMongoDB.HISTORY_LOST_RESTART_FROM_NOW.getValue());
+
+        runner.run(1, false, true);
+        assertNull(runner.getStateManager().getState(Scope.CLUSTER).get(StateKeys.RESUME_TOKEN),
+                "the position the server cannot serve must be given up");
+
+        runner.run(1, false, false);
+        collection.insertOne(new Document("_id", "after-restart"));
+
+        final List<Document> records = readRecords(1);
+        assertEquals(1, records.size());
+        assertEquals("{\"_id\": \"after-restart\"}", records.getFirst().getString("document_key"));
+        assertNotEquals(lostToken, runner.getStateManager().getState(Scope.CLUSTER).get(StateKeys.RESUME_TOKEN));
+    }
+
+    /**
+     * Leaves the processor stopped with a stored resume token the server rejects. The token is a real one whose
+     * timestamp is moved far back, which is what the server sees after the oplog has passed the stored position;
+     * filling a small oplog does not work in a test because the server truncates it in the background.
+     */
+    private String stopWithAPositionTheServerCannotServe() throws Exception {
+        startStream();
+        collection.insertOne(new Document("_id", "before"));
+
+        final List<Document> records = readRecords(1);
+        assertEquals(1, records.size());
+        final String realToken = records.getFirst().getString("resume_token");
+        assertTrue(realToken.startsWith("82"), "unexpected resume token format: " + realToken);
+
+        runner.run(1, true, false);
+        runner.clearTransferState();
+
+        final String backdatedToken = realToken.substring(0, 2) + "60000000" + realToken.substring(10);
+        runner.getStateManager().setState(Map.of(StateKeys.RESUME_TOKEN, backdatedToken), Scope.CLUSTER);
+        return backdatedToken;
+    }
+
     @Test
     void verifyReportsTheConnectionTheDeploymentAndTheVersion() {
         final List<ConfigVerificationResult> results =
@@ -201,13 +349,41 @@ abstract class AbstractCaptureChangeMongoDBIT {
     private List<Document> readRecords(final int expected) {
         final List<Document> records = new ArrayList<>();
         for (int trigger = 0; trigger < MAX_TRIGGERS && records.size() < expected; trigger++) {
-            runner.run(1, false, false);
-            for (final MockFlowFile flowFile : runner.getFlowFilesForRelationship(CaptureChangeMongoDB.REL_SUCCESS)) {
-                flowFile.getContent().lines().filter(line -> !line.isBlank()).map(Document::parse).forEach(records::add);
-            }
-            runner.clearTransferState();
+            collect(records);
         }
         return records;
+    }
+
+    private List<Document> readUntil(final Predicate<Document> last) {
+        final List<Document> records = new ArrayList<>();
+        for (int trigger = 0; trigger < MAX_TRIGGERS && records.stream().noneMatch(last); trigger++) {
+            collect(records);
+        }
+        return records;
+    }
+
+    /**
+     * Keeps triggering while the processor is waiting between attempts, so that the recovery after an outage is
+     * given the time the growing wait asks for.
+     */
+    private List<Document> readRecordsWaiting(final int expected) throws InterruptedException {
+        final List<Document> records = new ArrayList<>();
+        final long deadline = System.currentTimeMillis() + RECOVERY_TIMEOUT_MILLIS;
+        while (records.size() < expected && System.currentTimeMillis() < deadline) {
+            collect(records);
+            if (records.size() < expected) {
+                Thread.sleep(500L);
+            }
+        }
+        return records;
+    }
+
+    private void collect(final List<Document> records) {
+        runner.run(1, false, false);
+        for (final MockFlowFile flowFile : runner.getFlowFilesForRelationship(CaptureChangeMongoDB.REL_SUCCESS)) {
+            flowFile.getContent().lines().filter(line -> !line.isBlank()).map(Document::parse).forEach(records::add);
+        }
+        runner.clearTransferState();
     }
 
     private Document opcounters() {

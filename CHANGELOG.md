@@ -18,6 +18,13 @@ All notable changes to this project are recorded here. The format follows
   oplog while nothing changes.
 - `Max Events Per FlowFile`, `Max Batch Duration` and `Max Await Time` bound how much a single trigger reads
   and how long it blocks.
+- An `invalidate` event, which the server sends when the watched collection is dropped or renamed, is
+  delivered like any other event, and the stream carries on after it with `startAfter`.
+- `On History Lost` decides what happens when the server can no longer serve the stored position: `Fail`
+  keeps the position and reports the problem, `Restart From Now` gives it up and continues with the changes
+  made from then on.
+- After a failed attempt the processor waits before trying again, doubling the wait up to a minute and
+  giving it up as soon as a trigger succeeds, so an unreachable server is not asked on every trigger.
 - `verify` checks the connection, that the server is a replica set or a sharded cluster, and that it is
   MongoDB 6.0 or later.
 - Maven skeleton with the `nifi-cdc-mongodb-processors` and `nifi-cdc-mongodb-nar` modules, parented to
@@ -32,4 +39,3 @@ All notable changes to this project are recorded here. The format follows
 - Collection scope only. Database scope, the aggregation pipeline, the full document options and
   `Start Position` follow.
 - Deployment scope is not possible through the current `MongoDBClientService`; see `docs/prior-art.md`.
-- An `invalidate` event ends the stream. Continuing after it is not implemented yet.

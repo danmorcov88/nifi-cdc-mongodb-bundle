@@ -50,7 +50,9 @@ class StreamOpener {
 
         final BsonDocument resumeToken = EventMapper.resumeToken(resumeTokenData);
         if (resumeToken != null) {
-            stream = stream.resumeAfter(resumeToken);
+            // startAfter continues from the token like resumeAfter, and unlike resumeAfter it also works when the
+            // token belongs to an invalidate event, so the stream survives a dropped or renamed collection.
+            stream = stream.startAfter(resumeToken);
         }
 
         // Bounds how long tryNext() waits on an idle stream, so that a trigger returns promptly.

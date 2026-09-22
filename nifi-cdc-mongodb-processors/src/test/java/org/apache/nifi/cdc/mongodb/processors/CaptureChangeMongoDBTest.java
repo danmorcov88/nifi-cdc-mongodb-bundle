@@ -16,6 +16,9 @@
  */
 package org.apache.nifi.cdc.mongodb.processors;
 
+import com.mongodb.MongoCommandException;
+import com.mongodb.MongoException;
+import com.mongodb.ServerAddress;
 import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import org.apache.nifi.cdc.mongodb.event.ChangeEvents;
@@ -27,31 +30,37 @@ import org.apache.nifi.util.MockFlowFile;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
 import org.bson.BsonDocument;
+import org.bson.BsonInt32;
+import org.bson.BsonString;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Drives the processor with a fake cursor, so the batch loop, the stored resume token and the behaviour after a
- * failure are covered without a server.
+ * Drives the processor with a fake cursor and a clock the test moves, so the batch loop, the stored resume token
+ * and the behaviour after a failure are covered without a server.
  */
 class CaptureChangeMongoDBTest {
 
     private static final String INITIAL_TOKEN = "token-at-open";
+    private static final long INITIAL_BACKOFF_MILLIS = 1_000L;
 
     private final TestableProcessor processor = new TestableProcessor();
 
     @Test
     void eventsAreWrittenAsOneFlowFileAndTheLastTokenIsStored() throws Exception {
-        processor.cursors.add(new FakeChangeStreamCursor(INITIAL_TOKEN, events("t1", "t2", "t3")));
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1", "t2", "t3"));
         final TestRunner runner = createRunner(new MockRecordWriter("header", false));
 
         runner.run();
@@ -71,7 +80,7 @@ class CaptureChangeMongoDBTest {
 
     @Test
     void maxEventsPerFlowFileEndsTheBatch() throws Exception {
-        processor.cursors.add(new FakeChangeStreamCursor(INITIAL_TOKEN, events("t1", "t2", "t3", "t4")));
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1", "t2", "t3", "t4"));
         final TestRunner runner = createRunner(new MockRecordWriter("header", false));
         runner.setProperty(CaptureChangeMongoDB.MAX_EVENTS_PER_FLOWFILE, "2");
 
@@ -85,7 +94,7 @@ class CaptureChangeMongoDBTest {
 
     @Test
     void anIdleStreamStoresThePositionTheServerReports() throws Exception {
-        processor.cursors.add(new FakeChangeStreamCursor(INITIAL_TOKEN, List.of()));
+        processor.addCursor(cursor(INITIAL_TOKEN));
         final TestRunner runner = createRunner(new MockRecordWriter("header", false));
 
         runner.run();
@@ -96,9 +105,9 @@ class CaptureChangeMongoDBTest {
 
     @Test
     void aStoredTokenIsUsedToReopenTheStreamAfterARestart() throws Exception {
-        processor.cursors.add(new FakeChangeStreamCursor("ignored", events("t9")));
+        processor.addCursor(cursor("ignored", "t9"));
         final TestRunner runner = createRunner(new MockRecordWriter("header", false));
-        runner.getStateManager().setState(java.util.Map.of(StateKeys.RESUME_TOKEN, "stored-token"), Scope.CLUSTER);
+        runner.getStateManager().setState(Map.of(StateKeys.RESUME_TOKEN, "stored-token"), Scope.CLUSTER);
 
         runner.run();
 
@@ -112,11 +121,13 @@ class CaptureChangeMongoDBTest {
      */
     @Test
     void aFailedBatchIsDiscardedAndItsEventsAreReadAgain() throws Exception {
-        processor.cursors.add(new FakeChangeStreamCursor(INITIAL_TOKEN, events("t1", "t2", "t3")).failAfter(2));
-        processor.cursors.add(new FakeChangeStreamCursor(INITIAL_TOKEN, events("t1", "t2", "t3")));
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1", "t2", "t3").failAfter(2));
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1", "t2", "t3"));
         final TestRunner runner = createRunner(new MockRecordWriter("header", false));
 
-        runner.run(2, true, true);
+        runner.run(1, false, true);
+        processor.advance(INITIAL_BACKOFF_MILLIS);
+        runner.run(1, false, false);
 
         runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 1);
         final MockFlowFile flowFile = runner.getFlowFilesForRelationship(CaptureChangeMongoDB.REL_SUCCESS).getFirst();
@@ -125,7 +136,7 @@ class CaptureChangeMongoDBTest {
 
         runner.getStateManager().assertStateEquals(StateKeys.RESUME_TOKEN, "t3", Scope.CLUSTER);
         assertEquals(Arrays.asList(null, INITIAL_TOKEN), processor.openedFrom);
-        assertTrue(processor.cursors.getFirst().isClosed(), "the broken cursor must be closed");
+        assertTrue(processor.opened.getFirst().isClosed(), "the broken cursor must be closed");
     }
 
     /**
@@ -133,19 +144,19 @@ class CaptureChangeMongoDBTest {
      */
     @Test
     void aBatchThatCannotBeWrittenLeavesNoTokenBehind() throws Exception {
-        processor.cursors.add(new FakeChangeStreamCursor(INITIAL_TOKEN, events("t1", "t2", "t3")));
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1", "t2", "t3"));
         final TestRunner runner = createRunner(new MockRecordWriter("header", false, 2));
 
         runner.run();
 
         runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 0);
         runner.getStateManager().assertStateNotSet(Scope.CLUSTER);
-        assertTrue(processor.cursors.getFirst().isClosed(), "the cursor must be closed so that it is reopened");
+        assertTrue(processor.opened.getFirst().isClosed(), "the cursor must be closed so that it is reopened");
     }
 
     @Test
     void theTransitUriDoesNotRepeatThePasswordOfTheClientService() throws Exception {
-        processor.cursors.add(new FakeChangeStreamCursor(INITIAL_TOKEN, events("t1")));
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1"));
         final TestRunner runner = createRunner(new MockRecordWriter("header", false));
 
         runner.run();
@@ -155,6 +166,136 @@ class CaptureChangeMongoDBTest {
         final String transitUri = provenanceEvents.getFirst().getTransitUri();
         assertFalse(transitUri.contains("s3cret"), "transit URI must not carry the password: " + transitUri);
         assertEquals("mongodb://mongo.example:27017/lab.orders", transitUri);
+    }
+
+    /**
+     * The server ends the stream after an invalidate. The event is delivered like any other, and the next stream
+     * carries on from its token.
+     */
+    @Test
+    void anInvalidateIsDeliveredAndTheStreamCarriesOnAfterIt() throws Exception {
+        final FakeChangeStreamCursor invalidated = new FakeChangeStreamCursor(INITIAL_TOKEN,
+                List.of(ChangeEvents.insert("t1"), ChangeEvents.invalidate("t2")));
+        processor.addCursor(invalidated);
+        processor.addCursor(cursor("t2", "t3"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+
+        runner.run(1, false, true);
+        runner.run(1, false, false);
+
+        runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 2);
+        final List<MockFlowFile> flowFiles = runner.getFlowFilesForRelationship(CaptureChangeMongoDB.REL_SUCCESS);
+        flowFiles.getFirst().assertAttributeEquals(CaptureChangeMongoDB.ATTRIBUTE_RECORD_COUNT, "2");
+        flowFiles.getFirst().assertAttributeEquals(CaptureChangeMongoDB.ATTRIBUTE_LAST_RESUME_TOKEN, "t2");
+        flowFiles.get(1).assertAttributeEquals(CaptureChangeMongoDB.ATTRIBUTE_LAST_RESUME_TOKEN, "t3");
+
+        assertTrue(invalidated.isClosed(), "the invalidated cursor must be closed");
+        assertEquals(Arrays.asList(null, "t2"), processor.openedFrom);
+        runner.getStateManager().assertStateEquals(StateKeys.RESUME_TOKEN, "t3", Scope.CLUSTER);
+    }
+
+    /**
+     * With the default On History Lost the stored position is kept, so that nobody loses changes without noticing.
+     */
+    @Test
+    void historyLostKeepsTheStoredTokenByDefault() throws Exception {
+        processor.addOpenFailure(historyLost());
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+        runner.getStateManager().setState(Map.of(StateKeys.RESUME_TOKEN, "old-token"), Scope.CLUSTER);
+
+        runner.run();
+
+        runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 0);
+        runner.getStateManager().assertStateEquals(StateKeys.RESUME_TOKEN, "old-token", Scope.CLUSTER);
+        assertEquals(List.of("old-token"), processor.openedFrom);
+    }
+
+    /**
+     * A server that cannot find the token reports the general fatal stream error rather than the history error, so
+     * that message has to count as a lost position too.
+     */
+    @Test
+    void aTokenTheServerCannotFindCountsAsALostPosition() throws Exception {
+        processor.addOpenFailure(changeStreamFatalError("cannot resume stream; the resume token was not found"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+        runner.setProperty(CaptureChangeMongoDB.ON_HISTORY_LOST, CaptureChangeMongoDB.HISTORY_LOST_RESTART_FROM_NOW.getValue());
+        runner.getStateManager().setState(Map.of(StateKeys.RESUME_TOKEN, "old-token"), Scope.CLUSTER);
+
+        runner.run();
+
+        assertNull(runner.getStateManager().getState(Scope.CLUSTER).get(StateKeys.RESUME_TOKEN),
+                "a position the server cannot find must be given up");
+    }
+
+    /**
+     * Any other fatal stream error stays an ordinary failure, so a stored position is never given up by accident.
+     */
+    @Test
+    void anotherFatalStreamErrorKeepsTheStoredPosition() throws Exception {
+        processor.addOpenFailure(changeStreamFatalError("the change stream cannot be opened for another reason"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+        runner.setProperty(CaptureChangeMongoDB.ON_HISTORY_LOST, CaptureChangeMongoDB.HISTORY_LOST_RESTART_FROM_NOW.getValue());
+        runner.getStateManager().setState(Map.of(StateKeys.RESUME_TOKEN, "old-token"), Scope.CLUSTER);
+
+        runner.run();
+
+        runner.getStateManager().assertStateEquals(StateKeys.RESUME_TOKEN, "old-token", Scope.CLUSTER);
+    }
+
+    @Test
+    void historyLostCanGiveUpThePositionAndRestartFromNow() throws Exception {
+        processor.addOpenFailure(historyLost());
+        processor.addCursor(cursor("fresh", "t1"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+        runner.setProperty(CaptureChangeMongoDB.ON_HISTORY_LOST, CaptureChangeMongoDB.HISTORY_LOST_RESTART_FROM_NOW.getValue());
+        runner.getStateManager().setState(Map.of(StateKeys.RESUME_TOKEN, "old-token"), Scope.CLUSTER);
+
+        runner.run(1, false, true);
+        runner.run(1, false, false);
+
+        assertEquals(Arrays.asList("old-token", null), processor.openedFrom);
+        runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 1);
+        runner.getStateManager().assertStateEquals(StateKeys.RESUME_TOKEN, "t1", Scope.CLUSTER);
+    }
+
+    /**
+     * While the server is unreachable the processor waits longer after every attempt, and it stops waiting as soon
+     * as a trigger succeeds.
+     */
+    @Test
+    void failuresAreRetriedWithAGrowingWait() throws Exception {
+        processor.addOpenFailure(new MongoException("the server is unreachable"));
+        processor.addOpenFailure(new MongoException("the server is unreachable"));
+        processor.addCursor(cursor(INITIAL_TOKEN, "t1", "t2"));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+        // one event per FlowFile, so the trigger after the successful one has something left to read
+        runner.setProperty(CaptureChangeMongoDB.MAX_EVENTS_PER_FLOWFILE, "1");
+
+        runner.run(1, false, true);
+        assertEquals(1, processor.openedFrom.size());
+
+        processor.advance(INITIAL_BACKOFF_MILLIS - 1);
+        runner.run(1, false, false);
+        assertEquals(1, processor.openedFrom.size(), "the server must not be asked again before the wait is over");
+
+        processor.advance(1);
+        runner.run(1, false, false);
+        assertEquals(2, processor.openedFrom.size());
+
+        // the wait doubled, so the same step is not enough this time
+        processor.advance(INITIAL_BACKOFF_MILLIS);
+        runner.run(1, false, false);
+        assertEquals(2, processor.openedFrom.size(), "the wait must grow after every failure");
+
+        processor.advance(INITIAL_BACKOFF_MILLIS);
+        runner.run(1, false, false);
+        assertEquals(3, processor.openedFrom.size());
+        runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 1);
+
+        // the successful trigger gives up the wait, so the next one reads the remaining event without waiting
+        runner.run(1, false, false);
+        runner.assertTransferCount(CaptureChangeMongoDB.REL_SUCCESS, 2);
+        runner.getStateManager().assertStateEquals(StateKeys.RESUME_TOKEN, "t2", Scope.CLUSTER);
     }
 
     private TestRunner createRunner(final MockRecordWriter writer) throws InitializationException {
@@ -174,21 +315,63 @@ class CaptureChangeMongoDBTest {
         return runner;
     }
 
-    private static List<ChangeStreamDocument<BsonDocument>> events(final String... resumeTokens) {
-        return Stream.of(resumeTokens).map(ChangeEvents::insert).toList();
+    private static FakeChangeStreamCursor cursor(final String initialResumeToken, final String... eventTokens) {
+        return new FakeChangeStreamCursor(initialResumeToken, Stream.of(eventTokens).map(ChangeEvents::insert).toList());
     }
 
+    private static MongoCommandException historyLost() {
+        return new MongoCommandException(BsonDocument.parse("""
+                {
+                  "ok": 0,
+                  "code": 286,
+                  "codeName": "ChangeStreamHistoryLost",
+                  "errmsg": "Resume of change stream was not possible, as the resume point may no longer be in the oplog."
+                }
+                """), new ServerAddress());
+    }
+
+    private static MongoCommandException changeStreamFatalError(final String message) {
+        return new MongoCommandException(new BsonDocument()
+                .append("ok", new BsonInt32(0))
+                .append("code", new BsonInt32(280))
+                .append("codeName", new BsonString("ChangeStreamFatalError"))
+                .append("errmsg", new BsonString(message)), new ServerAddress());
+    }
 
     private static class TestableProcessor extends CaptureChangeMongoDB {
 
-        private final List<FakeChangeStreamCursor> cursors = new ArrayList<>();
+        private final List<Supplier<MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>>>> openings = new ArrayList<>();
+        private final List<FakeChangeStreamCursor> opened = new ArrayList<>();
         private final List<String> openedFrom = new ArrayList<>();
-        private int opened;
+        private long now = System.currentTimeMillis();
+        private int index;
+
+        void addCursor(final FakeChangeStreamCursor cursor) {
+            openings.add(() -> {
+                opened.add(cursor);
+                return cursor;
+            });
+        }
+
+        void addOpenFailure(final RuntimeException failure) {
+            openings.add(() -> {
+                throw failure;
+            });
+        }
+
+        void advance(final long millis) {
+            now += millis;
+        }
 
         @Override
         protected MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> openCursor(final String resumeTokenData) {
             openedFrom.add(resumeTokenData);
-            return cursors.get(opened++);
+            return openings.get(index++).get();
+        }
+
+        @Override
+        protected long currentTimeMillis() {
+            return now;
         }
     }
 }

@@ -38,6 +38,21 @@ public final class ChangeEvents {
         return codec.decode(new BsonDocumentReader(BsonDocument.parse(eventJson)), DecoderContext.builder().build());
     }
 
+    /**
+     * The event the server sends when the watched collection is dropped or renamed. It carries no namespace and no
+     * document key.
+     */
+    public static ChangeStreamDocument<BsonDocument> invalidate(final String resumeToken) {
+        return decode("""
+                {
+                  "_id": {"_data": "%s"},
+                  "operationType": "invalidate",
+                  "clusterTime": {"$timestamp": {"t": 1700000000, "i": 2}},
+                  "wallTime": {"$date": "2023-11-14T22:13:20Z"}
+                }
+                """.formatted(resumeToken));
+    }
+
     public static ChangeStreamDocument<BsonDocument> insert(final String resumeToken) {
         return decode("""
                 {
