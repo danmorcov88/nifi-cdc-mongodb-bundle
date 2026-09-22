@@ -1,0 +1,59 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Development lab: a single-node MongoDB replica set and a NiFi instance that loads the NAR
+# built by `./mvnw package`.
+#
+#   docker compose -f docker/compose.yml up -d mongo      # database only
+#   docker compose -f docker/compose.yml --profile nifi up -d
+#
+# The replica set advertises its member as mongo:27017, so from NiFi the connection URI is
+# mongodb://mongo:27017/?replicaSet=rs0. From the host machine, address the server directly:
+# mongosh mongodb://localhost:27017/?directConnection=true
+#
+# The lab runs without authentication. The privileges a real deployment needs are in the README.
+
+services:
+  mongo:
+    image: mongo:8.0
+    container_name: cdc-mongodb
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - ./init-replica-set.js:/init-replica-set.js:ro
+    healthcheck:
+      # Doubles as the one-time replica set initiation; see init-replica-set.js.
+      test: ["CMD", "mongosh", "--quiet", "--file", "/init-replica-set.js"]
+      interval: 5s
+      timeout: 30s
+      retries: 30
+
+  nifi:
+    image: apache/nifi:2.12.0
+    container_name: cdc-mongodb-nifi
+    profiles: ["nifi"]
+    ports:
+      - "8443:8443"
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: adminadminadmin
+      NIFI_WEB_HTTPS_PORT: "8443"
+      NIFI_WEB_PROXY_HOST: localhost:8443
+    volumes:
+      - ../nifi-cdc-mongodb-nar/target/nifi-cdc-mongodb-nar-2.12.0.nar:/opt/nifi/nifi-current/nar_extensions/nifi-cdc-mongodb-nar-2.12.0.nar:ro
+    depends_on:
+      mongo:
+        condition: service_healthy
