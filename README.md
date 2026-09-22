@@ -24,9 +24,12 @@ intended as a contribution for [NIFI-7180](https://issues.apache.org/jira/browse
 
 ## Status
 
-**Work in progress.** This is the module skeleton: the NAR builds and `CaptureChangeMongoDB` appears in the
-NiFi palette, but it does not read change events yet. Starting it raises an error telling you so. Reading
-the change stream is the next step.
+**Work in progress.** The processor reads the change stream of a single collection and writes the events as
+records, resuming from the stored resume token after a restart. Covered by unit tests and by integration
+tests against MongoDB 7.0 and 8.0.
+
+Not there yet: database scope, the aggregation pipeline, the full document and pre-image options,
+`Start Position`, the initial snapshot, and continuing after an `invalidate` event.
 
 ## Requirements
 

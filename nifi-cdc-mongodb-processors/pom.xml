@@ -45,6 +45,12 @@
             <version>2.12.0</version>
             <scope>provided</scope>
         </dependency>
+        <!-- Referenced by MongoDBClientService; both come from nifi-mongodb-client-service-api-nar at runtime. -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-ssl-context-service-api</artifactId>
+            <scope>provided</scope>
+        </dependency>
         <dependency>
             <groupId>org.mongodb</groupId>
             <artifactId>mongodb-driver-sync</artifactId>
