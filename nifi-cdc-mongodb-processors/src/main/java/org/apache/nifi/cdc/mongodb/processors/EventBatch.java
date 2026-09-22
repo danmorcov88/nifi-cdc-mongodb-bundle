@@ -79,13 +79,7 @@ class EventBatch {
     }
 
     void write(final ChangeStreamDocument<BsonDocument> event) throws IOException {
-        if (writer == null) {
-            begin();
-        }
-
-        final Record record = eventMapper.map(event);
-        writer.write(record);
-        eventCount++;
+        write(eventMapper.map(event));
 
         final String resumeToken = EventMapper.resumeTokenData(event.getResumeToken());
         if (firstResumeToken == null) {
@@ -93,6 +87,17 @@ class EventBatch {
         }
         lastResumeToken = resumeToken;
         lastWallTimeMillis = event.getWallTime() == null ? null : event.getWallTime().getValue();
+    }
+
+    /**
+     * A record that is not a change event, so it carries no resume token: a document read by the initial snapshot.
+     */
+    void write(final Record record) throws IOException {
+        if (writer == null) {
+            begin();
+        }
+        writer.write(record);
+        eventCount++;
     }
 
     void transfer(final Relationship relationship) throws IOException {
@@ -107,8 +112,11 @@ class EventBatch {
         final Map<String, String> attributes = new HashMap<>(result.getAttributes());
         attributes.put(CoreAttributes.MIME_TYPE.key(), writer.getMimeType());
         attributes.put(CaptureChangeMongoDB.ATTRIBUTE_RECORD_COUNT, Integer.toString(result.getRecordCount()));
-        attributes.put(CaptureChangeMongoDB.ATTRIBUTE_FIRST_RESUME_TOKEN, firstResumeToken);
-        attributes.put(CaptureChangeMongoDB.ATTRIBUTE_LAST_RESUME_TOKEN, lastResumeToken);
+        // The records of the initial snapshot are not change events, so they have neither token nor wall clock time.
+        if (firstResumeToken != null) {
+            attributes.put(CaptureChangeMongoDB.ATTRIBUTE_FIRST_RESUME_TOKEN, firstResumeToken);
+            attributes.put(CaptureChangeMongoDB.ATTRIBUTE_LAST_RESUME_TOKEN, lastResumeToken);
+        }
         if (lastWallTimeMillis != null) {
             attributes.put(CaptureChangeMongoDB.ATTRIBUTE_LAG_MILLIS, Long.toString(Math.max(0L, System.currentTimeMillis() - lastWallTimeMillis)));
         }

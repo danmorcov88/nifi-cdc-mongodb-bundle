@@ -22,6 +22,7 @@ import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import org.apache.nifi.cdc.mongodb.event.EventMapper;
 import org.apache.nifi.mongodb.MongoDBClientService;
 import org.bson.BsonDocument;
+import org.bson.BsonTimestamp;
 
 import java.util.concurrent.TimeUnit;
 
@@ -39,7 +40,7 @@ class StreamOpener {
         this.options = options;
     }
 
-    MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> open(final String resumeTokenData) {
+    MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> open(final String resumeTokenData, final BsonTimestamp startAtOperationTime) {
         ChangeStreamIterable<BsonDocument> stream = switch (options.scope()) {
             case COLLECTION -> clientService.getDatabase(options.databaseName())
                     .getCollection(options.collectionName(), BsonDocument.class)
@@ -53,8 +54,8 @@ class StreamOpener {
             // startAfter continues from the token like resumeAfter, and unlike resumeAfter it also works when the
             // token belongs to an invalidate event, so the stream survives a dropped or renamed collection.
             stream = stream.startAfter(resumeToken);
-        } else if (options.startAtOperationTime() != null) {
-            stream = stream.startAtOperationTime(options.startAtOperationTime());
+        } else if (startAtOperationTime != null) {
+            stream = stream.startAtOperationTime(startAtOperationTime);
         }
 
         return stream

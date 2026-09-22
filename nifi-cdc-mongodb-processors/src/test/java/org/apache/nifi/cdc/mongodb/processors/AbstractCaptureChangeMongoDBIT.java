@@ -41,11 +41,14 @@ import org.testcontainers.DockerClientFactory;
 import org.testcontainers.mongodb.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -64,6 +67,7 @@ abstract class AbstractCaptureChangeMongoDBIT {
     private static final String COLLECTION = "orders";
     private static final int MAX_TRIGGERS = 40;
     private static final long RECOVERY_TIMEOUT_MILLIS = 90_000L;
+    private static final int SNAPSHOT_DOCUMENTS = 50_000;
 
     private MongoDBContainer container;
     private MongoClient client;
@@ -433,6 +437,130 @@ abstract class AbstractCaptureChangeMongoDBIT {
     }
 
     @Test
+    void theInitialSnapshotWritesTheDocumentsAndThenCarriesOnWithTheChanges() {
+        collection.deleteMany(new Document());
+        for (int id = 1; id <= 10; id++) {
+            collection.insertOne(new Document("_id", id).append("total", id));
+        }
+        configureSnapshot(4);
+
+        runner.run(1, false, true);
+        final List<Document> snapshot = readRecords(10);
+
+        assertEquals(10, snapshot.size());
+        snapshot.forEach(record -> {
+            assertEquals("read", record.getString("operation"));
+            assertEquals(DATABASE, record.getString("database"));
+            assertEquals(COLLECTION, record.getString("collection"));
+            assertNull(record.getString("resume_token"), "a document that was already there is not a change");
+            assertTrue(record.get("cluster_time", Number.class).longValue() > 0L);
+        });
+        assertEquals(IntStream.rangeClosed(1, 10).boxed().toList(), idsOf(snapshot), "the snapshot reads in the order of the identifiers");
+        assertEquals("{\"_id\": 1, \"total\": 1}", snapshot.getFirst().getString("full_document"));
+
+        collection.updateOne(Filters.eq("_id", 1), Updates.set("total", 99));
+
+        // The stream carries on at the moment the snapshot was taken, which is the moment of the last write before
+        // it, so that write can arrive a second time as an event. That repeat is the at-least-once guarantee.
+        final List<Document> changes = readRecordsWaitingFor(record -> "update".equals(record.getString("operation")));
+        final Document update = changes.stream()
+                .filter(record -> "update".equals(record.getString("operation"))).findFirst().orElseThrow();
+        assertEquals(1, idOf(update));
+        assertEquals("{\"total\": 99}", update.getString("updated_fields"));
+        assertNotNull(update.getString("resume_token"));
+        assertEquals(List.of(), changes.stream().filter(record -> "read".equals(record.getString("operation"))).toList(),
+                "the snapshot is over, so nothing more is read from the collection");
+    }
+
+    /**
+     * Scenario 8: while the snapshot runs the collection keeps changing. Every document that was there when the
+     * snapshot started has to come out, either as a document it read or as a change that followed.
+     */
+    @Test
+    void theInitialSnapshotLosesNothingWhileTheCollectionIsWrittenTo() {
+        collection.deleteMany(new Document());
+        final List<Document> documents = new ArrayList<>();
+        for (int id = 1; id <= SNAPSHOT_DOCUMENTS; id++) {
+            documents.add(new Document("_id", id).append("total", id));
+            if (documents.size() == 1000) {
+                collection.insertMany(documents);
+                documents.clear();
+            }
+        }
+        configureSnapshot(1000);
+
+        runner.run(1, false, true);
+
+        final List<Document> records = new ArrayList<>();
+        for (int trigger = 0; trigger < SNAPSHOT_DOCUMENTS; trigger++) {
+            collect(records);
+            if (trigger == 3) {
+                // changes made in the middle of the snapshot, to documents it has already passed and to new ones
+                collection.updateOne(Filters.eq("_id", 1), Updates.set("total", -1));
+                collection.deleteOne(Filters.eq("_id", 2));
+                collection.insertOne(new Document("_id", SNAPSHOT_DOCUMENTS + 1).append("total", 0));
+            }
+            if (records.size() >= SNAPSHOT_DOCUMENTS && snapshotIsDone()) {
+                break;
+            }
+        }
+
+        final Set<Integer> read = records.stream()
+                .filter(record -> "read".equals(record.getString("operation")))
+                .map(AbstractCaptureChangeMongoDBIT::idOf)
+                .collect(Collectors.toSet());
+        final List<Integer> missing = IntStream.rangeClosed(1, SNAPSHOT_DOCUMENTS).boxed()
+                .filter(id -> !read.contains(id)).toList();
+        assertEquals(List.of(), missing, "every document that was there when the snapshot started must be read");
+        assertTrue(snapshotIsDone(), "the snapshot must finish");
+
+        // the changes made while the snapshot ran arrive from the change stream afterwards
+        final List<Document> changes = readRecordsWaitingFor(record -> "delete".equals(record.getString("operation")));
+        assertTrue(changes.stream().anyMatch(record -> "update".equals(record.getString("operation")) && idOf(record) == 1),
+                "the update made during the snapshot must arrive");
+        assertTrue(changes.stream().anyMatch(record -> "delete".equals(record.getString("operation")) && idOf(record) == 2),
+                "the delete made during the snapshot must arrive");
+    }
+
+    /**
+     * A snapshot that is stopped halfway carries on from the last document it committed, so nothing is read twice
+     * and nothing is skipped.
+     */
+    @Test
+    void anInterruptedSnapshotCarriesOnWhereItStopped() throws Exception {
+        collection.deleteMany(new Document());
+        final List<Document> documents = new ArrayList<>();
+        for (int id = 1; id <= 5000; id++) {
+            documents.add(new Document("_id", id));
+        }
+        collection.insertMany(documents);
+        configureSnapshot(1000);
+
+        runner.run(3, false, true);
+        final List<Document> firstPart = new ArrayList<>();
+        drain(firstPart);
+        assertEquals(3000, firstPart.size(), "three batches of a thousand");
+        assertNotNull(runner.getStateManager().getState(Scope.CLUSTER).get(StateKeys.SNAPSHOT_LAST_ID));
+        assertNull(runner.getStateManager().getState(Scope.CLUSTER).get(StateKeys.SNAPSHOT_DONE));
+
+        runner.run(1, true, false);
+        drain(firstPart);
+        runner.clearTransferState();
+
+        runner.run(1, false, true);
+        final List<Document> secondPart = new ArrayList<>();
+        for (int trigger = 0; trigger < 10 && !snapshotIsDone(); trigger++) {
+            collect(secondPart);
+        }
+
+        final List<Document> all = new ArrayList<>(firstPart);
+        all.addAll(secondPart);
+        final List<Integer> ids = idsOf(all.stream().filter(record -> "read".equals(record.getString("operation"))).toList());
+        assertEquals(IntStream.rangeClosed(1, 5000).boxed().toList(), ids,
+                "every document exactly once and in order, so the snapshot carried on instead of starting again");
+    }
+
+    @Test
     void verifyReportsTheConnectionTheDeploymentTheVersionAndThePrivileges() {
         final List<ConfigVerificationResult> results =
                 ((CaptureChangeMongoDB) runner.getProcessor()).verify(runner.getProcessContext(), runner.getLogger(), Map.of());
@@ -499,6 +627,45 @@ abstract class AbstractCaptureChangeMongoDBIT {
             }
         }
         return records;
+    }
+
+    private void configureSnapshot(final int batchSize) {
+        runner.setProperty(CaptureChangeMongoDB.START_POSITION, CaptureChangeMongoDB.START_POSITION_INITIAL_SNAPSHOT.getValue());
+        runner.setProperty(CaptureChangeMongoDB.SNAPSHOT_BATCH_SIZE, Integer.toString(batchSize));
+    }
+
+    private boolean snapshotIsDone() {
+        try {
+            return Boolean.parseBoolean(runner.getStateManager().getState(Scope.CLUSTER).get(StateKeys.SNAPSHOT_DONE));
+        } catch (final IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private List<Document> readRecordsWaitingFor(final Predicate<Document> wanted) {
+        final List<Document> records = new ArrayList<>();
+        for (int trigger = 0; trigger < MAX_TRIGGERS && records.stream().noneMatch(wanted); trigger++) {
+            collect(records);
+        }
+        return records;
+    }
+
+    /**
+     * Takes whatever is already queued without triggering again.
+     */
+    private void drain(final List<Document> records) {
+        for (final MockFlowFile flowFile : runner.getFlowFilesForRelationship(CaptureChangeMongoDB.REL_SUCCESS)) {
+            flowFile.getContent().lines().filter(line -> !line.isBlank()).map(Document::parse).forEach(records::add);
+        }
+        runner.clearTransferState();
+    }
+
+    private static List<Integer> idsOf(final List<Document> records) {
+        return records.stream().map(AbstractCaptureChangeMongoDBIT::idOf).toList();
+    }
+
+    private static int idOf(final Document record) {
+        return Document.parse(record.getString("document_key")).getInteger("_id");
     }
 
     private void collect(final List<Document> records) {

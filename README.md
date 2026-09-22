@@ -28,9 +28,10 @@ intended as a contribution for [NIFI-7180](https://issues.apache.org/jira/browse
 writes the events as records, resuming from the stored resume token after a restart. It supports a
 server-side aggregation pipeline, the full document and pre-image options, a start position in the past and
 both Extended JSON modes, and it survives a dropped collection, an unreachable server and a position the
-server can no longer serve. Covered by unit tests and by integration tests against MongoDB 7.0 and 8.0.
+server can no longer serve. It can take an initial snapshot of a collection first and carry on with the
+changes without a gap. Covered by unit tests and by integration tests against MongoDB 7.0 and 8.0.
 
-Not there yet: the initial snapshot.
+What is left for 0.1.0 is the documentation and the release.
 
 ## Requirements
 

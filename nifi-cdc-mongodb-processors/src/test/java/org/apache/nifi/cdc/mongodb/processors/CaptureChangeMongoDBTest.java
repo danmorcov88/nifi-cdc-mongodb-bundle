@@ -365,6 +365,22 @@ class CaptureChangeMongoDBTest {
         runner.getStateManager().assertStateEquals(StateKeys.STREAM_SOURCE, "collection:lab.orders", Scope.CLUSTER);
     }
 
+    /**
+     * The initial snapshot reads the documents of one collection, so it cannot be combined with database scope.
+     */
+    @Test
+    void theInitialSnapshotIsRefusedWithDatabaseScope() throws Exception {
+        processor.addCursor(cursor(INITIAL_TOKEN));
+        final TestRunner runner = createRunner(new MockRecordWriter("header", false));
+
+        runner.setProperty(CaptureChangeMongoDB.START_POSITION, CaptureChangeMongoDB.START_POSITION_INITIAL_SNAPSHOT.getValue());
+        runner.assertValid();
+
+        runner.removeProperty(CaptureChangeMongoDB.COLLECTION_NAME);
+        runner.setProperty(CaptureChangeMongoDB.WATCH_SCOPE, WatchScope.DATABASE);
+        runner.assertNotValid();
+    }
+
     private static String messageOf(final Throwable failure) {
         final StringBuilder messages = new StringBuilder();
         for (Throwable current = failure; current != null; current = current.getCause()) {

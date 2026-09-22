@@ -19,14 +19,13 @@ package org.apache.nifi.cdc.mongodb.processors;
 import com.mongodb.client.model.changestream.FullDocument;
 import com.mongodb.client.model.changestream.FullDocumentBeforeChange;
 import org.bson.BsonDocument;
-import org.bson.BsonTimestamp;
 
 import java.util.List;
 
 /**
- * Everything the watch call needs. {@code collectionName} is null for database scope, and
- * {@code startAtOperationTime} is null unless the stream should start at a point in time; a stored resume token
- * takes precedence over both.
+ * Everything the watch call needs that does not change while the processor runs. {@code collectionName} is null
+ * for database scope. Where the stream starts is decided when the cursor is opened, because an initial snapshot
+ * only learns its handover point while it runs.
  */
 record StreamOptions(
         WatchScope scope,
@@ -35,7 +34,6 @@ record StreamOptions(
         List<BsonDocument> pipeline,
         FullDocument fullDocument,
         FullDocumentBeforeChange fullDocumentBeforeChange,
-        BsonTimestamp startAtOperationTime,
         long maxAwaitTimeMillis) {
 
     /**

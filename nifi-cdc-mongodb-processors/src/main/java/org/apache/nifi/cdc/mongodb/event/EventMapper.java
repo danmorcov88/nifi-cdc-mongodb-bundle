@@ -56,7 +56,11 @@ public class EventMapper {
     public static final String FIELD_TXN_NUMBER = "txn_number";
     public static final String FIELD_RESUME_TOKEN = "resume_token";
 
+    /** The operation of a record that comes from the initial snapshot rather than from a change. */
+    public static final String OPERATION_READ = "read";
+
     private static final String RESUME_TOKEN_DATA = "_data";
+    private static final String ID = "_id";
 
     private static final RecordSchema EVENT_SCHEMA = new SimpleRecordSchema(List.of(
             new RecordField(FIELD_OPERATION, RecordFieldType.STRING.getDataType(), false),
@@ -70,7 +74,8 @@ public class EventMapper {
             new RecordField(FIELD_CLUSTER_TIME, RecordFieldType.LONG.getDataType(), false),
             new RecordField(FIELD_WALL_TIME, RecordFieldType.TIMESTAMP.getDataType()),
             new RecordField(FIELD_TXN_NUMBER, RecordFieldType.LONG.getDataType()),
-            new RecordField(FIELD_RESUME_TOKEN, RecordFieldType.STRING.getDataType(), false)));
+            // Null for the records of the initial snapshot: they are documents that were already there, not changes.
+            new RecordField(FIELD_RESUME_TOKEN, RecordFieldType.STRING.getDataType())));
 
     private final JsonWriterSettings jsonWriterSettings;
 
@@ -101,6 +106,34 @@ public class EventMapper {
         values.put(FIELD_RESUME_TOKEN, resumeTokenData(event.getResumeToken()));
 
         return new MapRecord(EVENT_SCHEMA, values);
+    }
+
+    /**
+     * A document read by the initial snapshot. It is not a change, so it carries no resume token and no wall clock
+     * time; its cluster time is the moment the snapshot is consistent with, which is where the change stream then
+     * carries on.
+     */
+    public Record mapSnapshotDocument(final BsonDocument document, final String databaseName, final String collectionName,
+                                      final BsonTimestamp snapshotTime) {
+        final Map<String, Object> values = new LinkedHashMap<>();
+        values.put(FIELD_OPERATION, OPERATION_READ);
+        values.put(FIELD_DATABASE, databaseName);
+        values.put(FIELD_COLLECTION, collectionName);
+        values.put(FIELD_DOCUMENT_KEY, toJson(documentKey(document)));
+        values.put(FIELD_FULL_DOCUMENT, toJson(document));
+        values.put(FIELD_FULL_DOCUMENT_BEFORE_CHANGE, null);
+        values.put(FIELD_UPDATED_FIELDS, null);
+        values.put(FIELD_REMOVED_FIELDS, null);
+        values.put(FIELD_CLUSTER_TIME, clusterTime(snapshotTime));
+        values.put(FIELD_WALL_TIME, null);
+        values.put(FIELD_TXN_NUMBER, null);
+        values.put(FIELD_RESUME_TOKEN, null);
+
+        return new MapRecord(EVENT_SCHEMA, values);
+    }
+
+    public static BsonDocument documentKey(final BsonDocument document) {
+        return new BsonDocument(ID, document.get(ID));
     }
 
     /**

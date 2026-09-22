@@ -24,6 +24,15 @@ final class StateKeys {
     /** What the stored resume token belongs to, so that it is never used for a different scope; see StreamOptions. */
     static final String STREAM_SOURCE = "stream.source";
 
+    /** Set once the initial snapshot has read the whole collection. */
+    static final String SNAPSHOT_DONE = "snapshot.done";
+
+    /** The identifier of the last document the snapshot wrote, as Extended JSON, so that it can carry on after it. */
+    static final String SNAPSHOT_LAST_ID = "snapshot.last.id";
+
+    /** The cluster time the snapshot is consistent with; the change stream carries on from there. */
+    static final String SNAPSHOT_START_TIME = "snapshot.start.time";
+
     private StateKeys() {
     }
 }

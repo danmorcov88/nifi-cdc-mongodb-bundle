@@ -32,7 +32,13 @@ All notable changes to this project are recorded here. The format follows
   that do not match never travel. Only the stages MongoDB allows on a change stream are accepted, and the
   pipeline is checked while the processor is configured.
 - `Start Position` decides where a stream without a stored position starts: at the moment the processor is
-  started, or at a given point in time.
+  started, at a given point in time, or after an initial snapshot.
+- `Start Position` = `Initial Snapshot` writes the documents the collection already holds first, as records
+  with the operation `read`, and then carries on with the changes made from the moment the snapshot started,
+  so nothing that changed while it ran is lost. A change made during the snapshot can arrive twice, once in
+  the snapshot and once as an event. The snapshot reads in the order of the identifiers and commits every
+  batch on its own, so a processor stopped in the middle carries on from the last document it wrote.
+  `Snapshot Batch Size` sets how many documents a batch holds. Collection scope only.
 - `Full Document` and `Full Document Before Change` decide whether an update event carries the document and
   the version before the change.
 - `Extended JSON Mode` writes the documents either readable or with every BSON type kept.
@@ -51,5 +57,4 @@ All notable changes to this project are recorded here. The format follows
 ### Known limitations
 
 - Deployment scope is not possible through the current `MongoDBClientService`; see `docs/prior-art.md`.
-- No initial snapshot yet, so a new flow starts with the changes and not with the documents that are
-  already there.
+- The initial snapshot reads one collection, so it cannot be combined with database scope.

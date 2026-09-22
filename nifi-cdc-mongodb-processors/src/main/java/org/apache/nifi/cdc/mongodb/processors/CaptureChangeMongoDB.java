@@ -60,6 +60,8 @@ import org.bson.json.JsonWriterSettings;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -79,14 +81,18 @@ import java.util.concurrent.TimeUnit;
         + "transaction as the FlowFiles of a batch, so a failure replays events but never skips them. The processor never writes to the "
         + "source database; it needs only the changeStream and find privileges on the watched scope. MongoDB 6.0 or later, running as a "
         + "replica set or a sharded cluster, is required. Without stored state the stream starts where Start Position says, by default "
-        + "at the moment the processor is started, so changes made before that are not captured. An invalidate event, which the server "
+        + "at the moment the processor is started, so changes made before that are not captured; Initial Snapshot writes the documents "
+        + "the collection already holds first, as records with the operation 'read', and then carries on with the changes made from the "
+        + "moment the snapshot started. An invalidate event, which the server "
         + "sends when the watched collection is dropped or renamed, is written like any other event and the stream continues after it. "
         + "When the server is unreachable the processor waits longer after every failed attempt, up to a minute, and continues from the "
         + "last committed position once the server answers again.")
 @Stateful(scopes = Scope.CLUSTER, description = "The resume token of the last change event written to a FlowFile is stored so that the "
         + "processor resumes from the same position after a restart or a change of the primary node, together with the scope the token "
         + "belongs to. A token is meaningless for another scope, database or collection, so the processor refuses to start when those "
-        + "change and asks for the state to be cleared.")
+        + "change and asks for the state to be cleared. While an initial snapshot runs, the moment it is consistent with and the "
+        + "identifier of the last document it wrote are stored as well, so that a processor stopped in the middle of a snapshot carries "
+        + "on from there instead of reading the collection again.")
 @WritesAttributes({
         @WritesAttribute(attribute = CaptureChangeMongoDB.ATTRIBUTE_DATABASE, description = "Database the events belong to"),
         @WritesAttribute(attribute = CaptureChangeMongoDB.ATTRIBUTE_COLLECTION, description = "Collection the events belong to"),
@@ -109,6 +115,10 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     private static final int MINIMUM_MAJOR_VERSION = 6;
     private static final String SHARDED_CLUSTER_MESSAGE = "isdbgrid";
     private static final String INVALIDATE_OPERATION = "invalidate";
+    private static final String ID_FIELD = "_id";
+
+    /** Canonical Extended JSON, so that an identifier kept in state comes back as exactly the same BSON value. */
+    private static final JsonWriterSettings STATE_JSON_SETTINGS = JsonWriterSettings.builder().outputMode(JsonMode.EXTENDED).build();
 
     private static final int HISTORY_LOST_CODE = 286;
     private static final String HISTORY_LOST_CODE_NAME = "ChangeStreamHistoryLost";
@@ -131,6 +141,10 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
             "Start with the changes made from the moment the processor is started. Changes made before that are not captured.");
     static final AllowableValue START_POSITION_TIMESTAMP = new AllowableValue("timestamp", "Timestamp",
             "Start with the changes made from the given point in time, as far back as the oplog of the server reaches.");
+    static final AllowableValue START_POSITION_INITIAL_SNAPSHOT = new AllowableValue("initial-snapshot", "Initial Snapshot",
+            "Write the documents the collection already holds first, as records with the operation 'read', and then carry on with the "
+                    + "changes made from the moment the snapshot started. A change made while the snapshot runs can appear twice, once "
+                    + "in the snapshot and once as an event, so the consumer has to tolerate a repeat. Collection scope only.");
 
     // The values are the ones the server understands, so that the driver enum can be built straight from them.
     static final AllowableValue FULL_DOCUMENT_DEFAULT = new AllowableValue("default", "Default",
@@ -214,8 +228,18 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
             .description("Where the stream starts when there is no stored resume token. Once a token is stored this is ignored, and the "
                     + "processor always continues from the stored position.")
             .required(true)
-            .allowableValues(START_POSITION_NOW, START_POSITION_TIMESTAMP)
+            .allowableValues(START_POSITION_NOW, START_POSITION_TIMESTAMP, START_POSITION_INITIAL_SNAPSHOT)
             .defaultValue(START_POSITION_NOW.getValue())
+            .build();
+
+    static final PropertyDescriptor SNAPSHOT_BATCH_SIZE = new PropertyDescriptor.Builder()
+            .name("Snapshot Batch Size")
+            .description("How many documents the initial snapshot reads and writes at a time. Each batch is committed on its own, so a "
+                    + "processor that is stopped in the middle of a snapshot carries on from the last committed document.")
+            .required(true)
+            .defaultValue("1000")
+            .addValidator(StandardValidators.POSITIVE_INTEGER_VALIDATOR)
+            .dependsOn(START_POSITION, START_POSITION_INITIAL_SNAPSHOT)
             .build();
 
     static final PropertyDescriptor START_TIMESTAMP = new PropertyDescriptor.Builder()
@@ -312,6 +336,7 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
             PIPELINE,
             START_POSITION,
             START_TIMESTAMP,
+            SNAPSHOT_BATCH_SIZE,
             FULL_DOCUMENT,
             FULL_DOCUMENT_BEFORE_CHANGE,
             EXTENDED_JSON_MODE,
@@ -346,6 +371,13 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     private volatile String onHistoryLost;
     private volatile String streamSource;
 
+    private volatile BsonTimestamp configuredStartTime;
+
+    private volatile SnapshotReader snapshotReader;
+    private volatile boolean snapshotPending;
+    private volatile String snapshotStartTime;
+    private volatile String snapshotLastId;
+
     private long backoffMillis;
     private long nextAttemptMillis;
     private boolean failing;
@@ -361,9 +393,42 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
         return RELATIONSHIPS;
     }
 
+    @Override
+    protected Collection<ValidationResult> customValidate(final ValidationContext context) {
+        final List<ValidationResult> results = new ArrayList<>();
+        final boolean snapshot = START_POSITION_INITIAL_SNAPSHOT.getValue().equals(context.getProperty(START_POSITION).getValue());
+        if (snapshot && WatchScope.DATABASE.getValue().equals(context.getProperty(WATCH_SCOPE).getValue())) {
+            results.add(new ValidationResult.Builder()
+                    .subject(START_POSITION.getDisplayName())
+                    .input(START_POSITION_INITIAL_SNAPSHOT.getDisplayName())
+                    .valid(false)
+                    .explanation(String.format("reads the documents of one collection, so it needs %s to be %s",
+                            WATCH_SCOPE.getDisplayName(), WatchScope.COLLECTION.getDisplayName()))
+                    .build());
+        }
+        return results;
+    }
+
     @OnScheduled
     public void onScheduled(final ProcessContext context) throws IOException {
         final MongoDBClientService clientService = context.getProperty(CLIENT_SERVICE).asControllerService(MongoDBClientService.class);
+        final StateMap storedState = context.getStateManager().getState(Scope.CLUSTER);
+
+        final boolean snapshotConfigured = START_POSITION_INITIAL_SNAPSHOT.getValue().equals(context.getProperty(START_POSITION).getValue());
+        snapshotStartTime = storedState.get(StateKeys.SNAPSHOT_START_TIME);
+        snapshotLastId = storedState.get(StateKeys.SNAPSHOT_LAST_ID);
+        snapshotPending = snapshotConfigured && !Boolean.parseBoolean(storedState.get(StateKeys.SNAPSHOT_DONE));
+        snapshotReader = snapshotConfigured
+                ? new SnapshotReader(clientService,
+                        context.getProperty(DATABASE_NAME).evaluateAttributeExpressions().getValue(),
+                        context.getProperty(COLLECTION_NAME).evaluateAttributeExpressions().getValue(),
+                        context.getProperty(SNAPSHOT_BATCH_SIZE).asInteger())
+                : null;
+
+        configuredStartTime = START_POSITION_TIMESTAMP.getValue().equals(context.getProperty(START_POSITION).getValue())
+                ? new BsonTimestamp(context.getProperty(START_TIMESTAMP).asInteger(), 0)
+                : null;
+
         final StreamOptions options = buildStreamOptions(context);
 
         streamOpener = new StreamOpener(clientService, options);
@@ -382,12 +447,11 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
         nextAttemptMillis = 0L;
         failing = false;
 
-        final StateMap state = context.getStateManager().getState(Scope.CLUSTER);
-        committedToken = state.get(StateKeys.RESUME_TOKEN);
+        committedToken = storedState.get(StateKeys.RESUME_TOKEN);
         resumeFrom = committedToken;
 
-        final String storedSource = state.get(StateKeys.STREAM_SOURCE);
-        if (committedToken != null && storedSource != null && !storedSource.equals(streamSource)) {
+        final String storedSource = storedState.get(StateKeys.STREAM_SOURCE);
+        if (storedSource != null && !storedSource.equals(streamSource)) {
             throw new ProcessException(String.format(
                     "The stored position belongs to %s and cannot be used for %s. Clear the state of the processor to start watching "
                             + "%s, keeping in mind that the changes made in the meantime are not captured.",
@@ -400,10 +464,6 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
         final String collectionName = scope == WatchScope.COLLECTION
                 ? context.getProperty(COLLECTION_NAME).evaluateAttributeExpressions().getValue()
                 : null;
-        final BsonTimestamp startAtOperationTime = START_POSITION_TIMESTAMP.getValue().equals(context.getProperty(START_POSITION).getValue())
-                ? new BsonTimestamp(context.getProperty(START_TIMESTAMP).asInteger(), 0)
-                : null;
-
         return new StreamOptions(
                 scope,
                 context.getProperty(DATABASE_NAME).evaluateAttributeExpressions().getValue(),
@@ -411,7 +471,6 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
                 parsePipeline(context.getProperty(PIPELINE).getValue()),
                 FullDocument.fromString(context.getProperty(FULL_DOCUMENT).getValue()),
                 FullDocumentBeforeChange.fromString(context.getProperty(FULL_DOCUMENT_BEFORE_CHANGE).getValue()),
-                startAtOperationTime,
                 context.getProperty(MAX_AWAIT_TIME).asTimePeriod(TimeUnit.MILLISECONDS));
     }
 
@@ -464,6 +523,11 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
         if (currentTimeMillis() < nextAttemptMillis) {
             context.yield();
+            return;
+        }
+
+        if (snapshotPending) {
+            readSnapshot(context, session);
             return;
         }
 
@@ -522,6 +586,75 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     }
 
     /**
+     * Writes one batch of the documents the collection already holds. The time the snapshot is consistent with is
+     * taken before the first document is read, so a change made while the snapshot runs is either already in what it
+     * reads or arrives afterwards from the change stream.
+     */
+    private void readSnapshot(final ProcessContext context, final ProcessSession session) {
+        final EventBatch batch = new EventBatch(session, writerFactory, eventMapper, getLogger(), transitUri, namespaceAttributes);
+        boolean completed = false;
+        try {
+            if (snapshotStartTime == null) {
+                snapshotStartTime = Long.toString(snapshotReader.currentClusterTime().getValue());
+                getLogger().info("Starting the initial snapshot of {}", transitUri);
+            }
+
+            final BsonValue afterId = snapshotLastId == null ? null : BsonDocument.parse(snapshotLastId).get(ID_FIELD);
+            final List<BsonDocument> documents = snapshotReader.readBatch(afterId);
+            final boolean lastBatch = documents.size() < snapshotReader.getBatchSize();
+
+            if (!documents.isEmpty()) {
+                final BsonTimestamp snapshotTime = new BsonTimestamp(Long.parseLong(snapshotStartTime));
+                for (final BsonDocument document : documents) {
+                    batch.write(eventMapper.mapSnapshotDocument(document, snapshotReader.getDatabaseName(),
+                            snapshotReader.getCollectionName(), snapshotTime));
+                }
+                batch.transfer(REL_SUCCESS);
+            }
+
+            final String lastId = documents.isEmpty()
+                    ? snapshotLastId
+                    : EventMapper.documentKey(documents.getLast()).toJson(STATE_JSON_SETTINGS);
+            session.setState(snapshotState(lastBatch, lastId), Scope.CLUSTER);
+            session.commitAsync(() -> {
+                snapshotLastId = lastId;
+                if (lastBatch) {
+                    snapshotPending = false;
+                    getLogger().info("The initial snapshot of {} is complete; continuing with the changes made since it started",
+                            transitUri);
+                }
+            }, this::onCommitFailure);
+
+            completed = true;
+            failing = false;
+            resetBackoff();
+            if (!lastBatch) {
+                getLogger().debug("Wrote {} documents of the initial snapshot of {}", documents.size(), transitUri);
+            }
+        } catch (final Exception e) {
+            backOff();
+            logFailure(String.format("Reading the initial snapshot of %s failed; the batch will be read again", transitUri), e);
+            context.yield();
+        } finally {
+            if (!completed) {
+                batch.rollback();
+            }
+        }
+    }
+
+    private Map<String, String> snapshotState(final boolean lastBatch, final String lastId) {
+        final Map<String, String> state = new HashMap<>();
+        state.put(StateKeys.STREAM_SOURCE, streamSource);
+        state.put(StateKeys.SNAPSHOT_START_TIME, snapshotStartTime);
+        if (lastBatch) {
+            state.put(StateKeys.SNAPSHOT_DONE, Boolean.TRUE.toString());
+        } else if (lastId != null) {
+            state.put(StateKeys.SNAPSHOT_LAST_ID, lastId);
+        }
+        return state;
+    }
+
+    /**
      * Reads events until the batch is full, the time is up or the stream has nothing more for now. Returns whether
      * the batch ends with an invalidate event.
      */
@@ -554,7 +687,15 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
     }
 
     private void commit(final ProcessSession session, final String resumeToken) throws IOException {
-        session.setState(Map.of(StateKeys.RESUME_TOKEN, resumeToken, StateKeys.STREAM_SOURCE, streamSource), Scope.CLUSTER);
+        final Map<String, String> state = new HashMap<>();
+        state.put(StateKeys.RESUME_TOKEN, resumeToken);
+        state.put(StateKeys.STREAM_SOURCE, streamSource);
+        if (snapshotStartTime != null) {
+            // Keep the snapshot marked as done, so that a restart does not read the whole collection again.
+            state.put(StateKeys.SNAPSHOT_START_TIME, snapshotStartTime);
+            state.put(StateKeys.SNAPSHOT_DONE, Boolean.TRUE.toString());
+        }
+        session.setState(state, Scope.CLUSTER);
         session.commitAsync(() -> {
             committedToken = resumeToken;
             resumeFrom = resumeToken;
@@ -653,7 +794,19 @@ public class CaptureChangeMongoDB extends AbstractProcessor implements Verifiabl
      * Factory method for the change stream cursor, overridable for tests.
      */
     protected MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> openCursor(final String resumeTokenData) {
-        return streamOpener.open(resumeTokenData);
+        return streamOpener.open(resumeTokenData, streamStartTime());
+    }
+
+    /**
+     * Where a stream without a stored token begins. After an initial snapshot that is the moment the snapshot is
+     * consistent with, so the changes made while it ran are read; the value is only known once the snapshot has
+     * started, which is why it is resolved here and not when the processor is scheduled.
+     */
+    private BsonTimestamp streamStartTime() {
+        if (snapshotStartTime != null) {
+            return new BsonTimestamp(Long.parseLong(snapshotStartTime));
+        }
+        return configuredStartTime;
     }
 
     /**
