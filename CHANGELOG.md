@@ -4,7 +4,9 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), the versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-09-22
+
+First usable release.
 
 ### Added
 
@@ -58,3 +60,13 @@ All notable changes to this project are recorded here. The format follows
 
 - Deployment scope is not possible through the current `MongoDBClientService`; see `docs/prior-art.md`.
 - The initial snapshot reads one collection, so it cannot be combined with database scope.
+
+### Documentation
+
+- README with the requirements, the exact `createRole` and `createUser` commands, a quick start with the
+  development lab, screenshots and records from a real run, the record and property tables, what the
+  at-least-once guarantee means for a consumer, the oplog window, a compatibility table and the
+  limitations.
+- `docs/how-it-works.md` on the trigger loop, start positions, state, why nothing is lost, invalidate,
+  a lost position, waiting after a failure, and the snapshot handover.
+- `examples/capture-change-mongodb.json`, the flow definition of the run the README shows.
