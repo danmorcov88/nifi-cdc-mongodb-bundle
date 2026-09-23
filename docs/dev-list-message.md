@@ -29,8 +29,9 @@ What it does:
   pre-image configuration.
 - Uses the existing `MongoDBClientService`, so connection settings and credentials stay in one place.
 
-It targets NiFi 2.12.0 and MongoDB 6.0 or later, and is covered by unit tests and Testcontainers
-integration tests against MongoDB 7.0 and 8.0.
+The standalone build targets NiFi 2.12.0; a branch against current main builds and tests there as well. It
+needs MongoDB 6.0 or later, and is covered by unit tests and Testcontainers integration tests against
+MongoDB 7.0 and 8.0.
 
 One question before I open the pull request. `MongoDBClientService` exposes `getDatabase(String)`,
 `getURI()` and `getWriteConcern()`. That covers collection scope and database scope. It does not cover a
